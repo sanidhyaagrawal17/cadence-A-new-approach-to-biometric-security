@@ -757,12 +757,11 @@ class CadenceApp(QMainWindow):
         
         card_layout.addStretch()
 
-        self.override_btn = QPushButton("⚠️ Force Override")
-        self.override_btn.setStyleSheet("background-color: transparent; border: 1px solid #ff3333; color: #ff3333; padding: 10px 20px; border-radius: 8px; font-weight: bold;")
-        self.override_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.override_btn.clicked.connect(self._force_override)
-        card_layout.addWidget(self.override_btn)
-        
+        self.wipe_btn = QPushButton("🛑 Wipe Biometrics")
+        self.wipe_btn.setStyleSheet("background-color: transparent; border: 1px solid #ff3333; color: #ff3333; padding: 10px 20px; border-radius: 8px; font-weight: bold;")
+        self.wipe_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.wipe_btn.clicked.connect(self._wipe_system)
+        card_layout.addWidget(self.wipe_btn)
         layout.addWidget(card)
 
         test_lbl = QLabel("Test Neural Rhythm Engine (Inline)", objectName="h2")
@@ -798,7 +797,38 @@ class CadenceApp(QMainWindow):
         self.is_locked = False
         self.dash_result.setText("System Override Engaged.")
         self.dash_result.setStyleSheet("color: #ffaa33;")
-
+    def _wipe_system(self):
+        """Physically shreds all local biometric data and resets the AI state."""
+        import shutil
+        
+        # 1. Ask for confirmation before destroying data
+        reply = QMessageBox.question(self, 'Confirm System Wipe', 
+                                     "Are you sure? This will permanently delete your neural keystroke profile and your encrypted face baseline.",
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                     QMessageBox.StandardButton.No)
+                                     
+        if reply == QMessageBox.StandardButton.Yes:
+            # 2. Obliterate the database folder from the OS
+            model_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "database", "models"))
+            if os.path.exists(model_dir):
+                shutil.rmtree(model_dir)
+                
+            # 3. Kill the current AI instances in RAM and generate blank ones
+            self.keystroke_engine = CadenceKeystrokeEngine()
+            self.face_engine = CadenceFaceEngine()
+            
+            # 4. Reset Global Application State
+            self.is_ai_ready = False
+            self.saved_password = ""
+            
+            # 5. Update UI to reflect the wiped state
+            self.sys_status.setText("● AI UNTRAINED")
+            self.sys_status.setStyleSheet("color: #ff3333; font-weight: bold;")
+            self.dash_result.setText("System Wiped. All Biometrics Destroyed.")
+            self.dash_result.setStyleSheet("color: #ff3333;")
+            
+            # 6. Kick the user back to the Rhythm Setup screen
+            self.route(1)
     def _test_login(self):
         typed_pwd = self.dash_test_input.text()
         dts = self.get_dts()
