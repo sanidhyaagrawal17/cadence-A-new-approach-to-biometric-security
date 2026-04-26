@@ -40,7 +40,7 @@ class TimingChart(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#111111"))
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
         if not self.data: return
         bar_width = 15
         spacing = 5
@@ -174,7 +174,7 @@ class SidebarCard(QFrame):
         super().mousePressEvent(event)
 
 # ==========================================
-# CAMERA THREAD (HD UPGRADE)
+# CAMERA THREAD
 # ==========================================
 class CameraThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
@@ -192,7 +192,6 @@ class CameraThread(QThread):
         while self.running:
             ret, frame = cap.read()
             if ret:
-                frame = cv2.flip(frame, 1)
                 self.change_pixmap_signal.emit(frame)
             time.sleep(0.03)
         cap.release()
@@ -202,98 +201,122 @@ class CameraThread(QThread):
         self.wait()
 
 # ==========================================
-# MOCK WINDOWS LOCK SCREEN
+# NATIVE APP LOCK SCREEN (CADENCE ENCLAVE)
 # ==========================================
 class MockWindowsLockScreen(QDialog):
     def __init__(self, parent=None, app_instance=None):
         super().__init__(parent)
         self.app = app_instance
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        
+        self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.showFullScreen()
+        
         self.setStyleSheet("""
-            QDialog { background-color: #000000; background-image: url('database/bg.jpg'); background-position: center; }
-            QLabel { background: transparent; color: white; font-family: 'Segoe UI', sans-serif; }
-            QLineEdit { background-color: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.3); 
-                        color: white; padding: 10px; border-radius: 4px; font-size: 16px; }
-            QLineEdit:focus { border: 1px solid #00ff88; background-color: rgba(0, 0, 0, 0.5); }
+            QDialog {
+                background-color: #050505;
+            }
+            QLabel { color: white; font-family: 'Segoe UI', sans-serif; }
+            QLineEdit {
+                background-color: #0f0f0f;
+                border: 1px solid #333333;
+                color: #00ff88;
+                padding: 15px;
+                border-radius: 8px;
+                font-size: 18px;
+                font-family: 'Consolas', monospace;
+                letter-spacing: 2px;
+            }
+            QLineEdit:focus { border: 1px solid #00ff88; background-color: #151515; }
+            QPushButton {
+                background-color: transparent;
+                border: 1px solid #ff3333;
+                color: #ff3333;
+                padding: 10px 30px;
+                border-radius: 8px;
+                font-family: 'Segoe UI';
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background-color: rgba(255, 51, 51, 0.1); }
         """)
 
         self.tms = []
         self.target_len = self.app.target_len if self.app.target_len > 0 else 5
 
-        layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.setSpacing(20)
-
-        self.time_lbl = QLabel(QDateTime.currentDateTime().toString("hh:mm"))
-        self.time_lbl.setStyleSheet("font-size: 72px; font-weight: bold;")
-        self.time_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(40, 40, 40, 40)
         
-        self.date_lbl = QLabel(QDateTime.currentDateTime().toString("dddd, MMMM d"))
-        self.date_lbl.setStyleSheet("font-size: 24px;")
-        self.date_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # --- TOP SECTION (Branding) ---
+        brand_layout = QHBoxLayout()
+        brand_lbl = QLabel("🛡️ CADENCE SECURE ENCLAVE")
+        brand_lbl.setStyleSheet("color: #00ff88; font-size: 14px; font-weight: bold; letter-spacing: 1px;")
+        brand_layout.addWidget(brand_lbl)
+        brand_layout.addStretch()
+        main_layout.addLayout(brand_layout)
 
-        self.avatar_lbl = QLabel("👤")
-        self.avatar_lbl.setStyleSheet("font-size: 80px; margin-top: 50px;")
-        self.avatar_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        self.name_lbl = QLabel("Cadence User")
-        self.name_lbl.setStyleSheet("font-size: 28px; font-weight: bold;")
-        self.name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        main_layout.addStretch()
+        
+        # --- CENTER SECTION (Lock Interface) ---
+        center_layout = QVBoxLayout()
+        center_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        center_layout.setSpacing(20)
+        
+        self.camera_lbl = QLabel()
+        self.camera_lbl.setFixedSize(400, 300)
+        self.camera_lbl.setStyleSheet("border: 2px solid #00ff88; border-radius: 8px; background-color: #0f0f0f;")
+        self.camera_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        title_lbl = QLabel("SYSTEM LOCKED")
+        title_lbl.setStyleSheet("font-size: 36px; font-weight: 800; letter-spacing: 4px;")
+        title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        sub_lbl = QLabel("Awaiting Dual-Layer Biometric Verification")
+        sub_lbl.setStyleSheet("font-size: 14px; color: #888888;")
+        sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.pwd_input = QLineEdit()
-        self.pwd_input.setPlaceholderText("PIN or Password")
+        self.pwd_input.setPlaceholderText("ENTER NEURAL RHYTHM")
         self.pwd_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self.pwd_input.setFixedWidth(300)
+        self.pwd_input.setFixedWidth(380)
+        self.pwd_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pwd_input.returnPressed.connect(self._evaluate_login)
         self.pwd_input.installEventFilter(self)
 
-        self.status_lbl = QLabel("Looking for you... 👁️")
-        self.status_lbl.setStyleSheet("font-size: 14px; color: #aaaaaa;")
+        self.status_lbl = QLabel("Initializing sensors... 👁️")
+        self.status_lbl.setStyleSheet("font-size: 14px; color: #aaaaaa; font-family: 'Consolas', monospace;")
         self.status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setStyleSheet("background-color: transparent; border: 1px solid #555; color: white; padding: 8px 20px; border-radius: 4px;")
-        self.cancel_btn.setFixedWidth(100)
+        center_layout.addWidget(self.camera_lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
+        center_layout.addSpacing(10)
+        center_layout.addWidget(title_lbl)
+        center_layout.addWidget(sub_lbl)
+        center_layout.addSpacing(20)
+        center_layout.addWidget(self.pwd_input, alignment=Qt.AlignmentFlag.AlignHCenter)
+        center_layout.addWidget(self.status_lbl)
+
+        main_layout.addLayout(center_layout)
+        main_layout.addStretch()
+
+        # --- BOTTOM SECTION (Emergency Override) ---
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch()
+        
+        self.cancel_btn = QPushButton("ABORT / RETURN TO DASHBOARD")
         self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.cancel_btn.clicked.connect(self.reject)
-
-        layout.addStretch()
-        layout.addWidget(self.time_lbl)
-        layout.addWidget(self.date_lbl)
-        layout.addWidget(self.avatar_lbl)
-        layout.addWidget(self.name_lbl)
         
-        input_container = QHBoxLayout()
-        input_container.addStretch()
-        input_container.addWidget(self.pwd_input)
-        input_container.addStretch()
-        layout.addLayout(input_container)
+        bottom_layout.addWidget(self.cancel_btn)
+        bottom_layout.addStretch()
         
-        layout.addWidget(self.status_lbl)
-        
-        btn_container = QHBoxLayout()
-        btn_container.addStretch()
-        btn_container.addWidget(self.cancel_btn)
-        btn_container.addStretch()
-        layout.addLayout(btn_container)
-        
-        layout.addStretch()
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._update_time)
-        self.timer.start(1000)
-
-    def _update_time(self):
-        self.time_lbl.setText(QDateTime.currentDateTime().toString("hh:mm"))
-        self.date_lbl.setText(QDateTime.currentDateTime().toString("dddd, MMMM d"))
+        main_layout.addLayout(bottom_layout)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
             if type(event) == QKeyEvent and not event.isAutoRepeat():
                 k = event.key()
                 if k not in (Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Backspace):
-                    self.tms.append(time.time())
+                    now = time.time()
+                    self.tms.append(now)
         return super().eventFilter(obj, event)
 
     def _get_dts(self):
@@ -305,15 +328,15 @@ class MockWindowsLockScreen(QDialog):
         self.pwd_input.clear()
 
         if typed_pwd != self.app.saved_password:
-            self._fail("Incorrect password.")
+            self._fail("ACCESS DENIED: Invalid Rhythm.")
             return
 
         if hasattr(self.app, 'live_frame') and self.app.face_engine.is_enrolled:
-            self.status_lbl.setText("Verifying Biometrics...")
+            self.status_lbl.setText("Analyzing Biometrics...")
             QApplication.processEvents()
             face_match = self.app.face_engine.verify_user(self.app.live_frame)
             if not face_match:
-                self._fail("Face not recognized.")
+                self._fail("ACCESS DENIED: Facial Match Failed.")
                 return
 
         pad_len = self.target_len - len(dts)
@@ -324,27 +347,26 @@ class MockWindowsLockScreen(QDialog):
 
         try:
             if self.app.keystroke_engine.is_deep_trained:
-                success = self.app.keystroke_engine.verify_deep_learning(dts)
+                success, score = self.app.keystroke_engine.verify_deep_learning(dts)
             else:
-                success = self.app.keystroke_engine.verify_quick_setup(np.array([dts]))
+                success, score = self.app.keystroke_engine.verify_quick_setup(np.array([dts]))
         except Exception as e:
-            self._fail(f"Neural Error: {str(e)}")
+            self._fail(f"SYSTEM ERROR: {str(e)}")
             return
 
         if success:
-            self.status_lbl.setText("Welcome.")
-            self.status_lbl.setStyleSheet("color: #00ff88; font-size: 16px;")
+            self.status_lbl.setText(f"ACCESS GRANTED (Match: {score:.2f})")
+            self.status_lbl.setStyleSheet("color: #00ff88; font-size: 16px; font-weight: bold; font-family: 'Consolas', monospace;")
             QApplication.processEvents()
             time.sleep(0.5)
             self.accept()
         else:
-            self._fail("Rhythm mismatch. Access Denied.")
+            self._fail(f"ACCESS DENIED: Rhythm Mismatch (Score: {score:.2f})")
 
     def _fail(self, msg):
         self.status_lbl.setText(msg)
-        self.status_lbl.setStyleSheet("color: #ff3333; font-size: 14px;")
+        self.status_lbl.setStyleSheet("color: #ff3333; font-size: 14px; font-weight: bold; font-family: 'Consolas', monospace;")
         self.tms.clear()
-
 
 # ==========================================
 # MAIN APPLICATION WINDOW
@@ -380,10 +402,15 @@ class CadenceApp(QMainWindow):
         self.face_engine = CadenceFaceEngine()
         self.camera_thread = None
         
-        # Load OpenCV's fast CPU face detector once upon application boot to prevent memory leaks
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        
+        # Stability Trackers
+        self.last_face_box = None
+        self.frame_counter = 0
+        self.missing_frames = 0 
 
         self.is_locked = False
+        self.is_locking = False  
         self.saved_password = ""
         self.is_ai_ready = self.keystroke_engine.is_quick_trained or self.keystroke_engine.is_deep_trained
 
@@ -394,6 +421,16 @@ class CadenceApp(QMainWindow):
         self.e_dts = []          
         self.mx = 5              
         self.target_len = 0
+        
+        # FIX: Restore Neural Target Length on Boot dynamically to prevent array dimension crashes
+        if self.is_ai_ready:
+            try:
+                if self.keystroke_engine.is_deep_trained:
+                    self.target_len = self.keystroke_engine.lstm_model.input_shape[1]
+                elif self.keystroke_engine.is_quick_trained:
+                    self.target_len = self.keystroke_engine.svm_model.n_features_in_
+            except Exception:
+                pass
         
         self.esy_str = (
             "the quick brown fox jumps\n"
@@ -408,8 +445,6 @@ class CadenceApp(QMainWindow):
         self.hover_timer = QTimer(self)
         self.hover_timer.timeout.connect(self._check_taskbar_hover)
         self.hover_timer.start(500)
-
-        QApplication.instance().installEventFilter(self)
 
         central_widget = QWidget()
         central_widget.setObjectName("main_container")
@@ -435,6 +470,12 @@ class CadenceApp(QMainWindow):
         main_layout.addWidget(self.build_footer())
 
         self.init_views()
+        
+        # TARGETED LISTENERS MOVED SAFELY BELOW UI CONSTRUCTION
+        self.dash_test_input.installEventFilter(self)  
+        self.rhythm_input.installEventFilter(self)     
+        self.installEventFilter(self)                  
+        
         self.route(0 if self.is_ai_ready else 1)
         self.showMaximized()
 
@@ -470,14 +511,35 @@ class CadenceApp(QMainWindow):
                 if k in (Qt.Key.Key_Shift, Qt.Key.Key_Control, Qt.Key.Key_Alt, Qt.Key.Key_Meta, Qt.Key.Key_CapsLock):
                     return super().eventFilter(obj, event)
 
-                if self.stack.currentIndex() == 1 and self.st == 'dp':
-                    if k == Qt.Key.Key_Backspace:
+                # FIX: Backspace Data Corruption Interceptor
+                if k == Qt.Key.Key_Backspace:
+                    if self.stack.currentIndex() == 1 and self.st == 'dp':
                         if len(self.typd) > 0:
                             self.typd = self.typd[:-1]
                             self._add_ts() 
                             self._upd_esy()
                         return True
-                    
+                    else:
+                        # Any typo ruins the continuous neural rhythm. Reset the field entirely to prevent bad AI training.
+                        if obj == self.rhythm_input:
+                            self.rhythm_input.clear()
+                            self.clr_trk()
+                            self._set_feedback("Typo detected. Neural rhythm corrupted. Field cleared.", "warning")
+                            return True
+                        elif obj == getattr(self, 'dash_test_input', None):
+                            self.dash_test_input.clear()
+                            self.clr_trk()
+                            self.dash_result.setText("Rhythm interrupted by Backspace. Field cleared.")
+                            self.dash_result.setStyleSheet("color: #ffaa33;")
+                            return True
+                        elif self.is_locking and hasattr(self, 'lock_screen') and obj == getattr(self.lock_screen, 'pwd_input', None):
+                            self.lock_screen.pwd_input.clear()
+                            self.lock_screen.tms.clear()
+                            self.lock_screen.status_lbl.setText("Rhythm broken. Restarting...")
+                            self.lock_screen.status_lbl.setStyleSheet("color: #ffaa33;")
+                            return True
+
+                if self.stack.currentIndex() == 1 and self.st == 'dp':
                     txt = event.text()
                     if txt == '\r': txt = '\n'
                     
@@ -525,9 +587,6 @@ class CadenceApp(QMainWindow):
         self.tms.clear()
         self.flight_times.clear()
 
-    # ==========================================
-    # ROUTING
-    # ==========================================
     def route(self, index):
         self.stop_camera()
         
@@ -553,8 +612,11 @@ class CadenceApp(QMainWindow):
             self.start_face_btn.setVisible(True)
             self.start_face_btn.setEnabled(True)
             self.start_face_btn.setText("Turn On Camera")
-            
             self.face_status_lbl.setText("")
+            
+            self.last_face_box = None
+            self.frame_counter = 0
+            self.missing_frames = 0
 
     def start_camera_for_view(self, target_label):
         if self.camera_thread is None or not self.camera_thread.isRunning():
@@ -564,76 +626,95 @@ class CadenceApp(QMainWindow):
             self.camera_thread.start()
 
     def update_camera_frame(self, cv_img):
-        # 1. Advanced Lighting Compensation (Gamma Boost + CLAHE)
-        try:
-            gamma = 1.4 
-            invGamma = 1.0 / gamma
-            table = np.array([((i / 255.0) ** invGamma) * 255 for i in np.arange(0, 256)]).astype("uint8")
-            brightened = cv2.LUT(cv_img, table)
-
-            lab = cv2.cvtColor(brightened, cv2.COLOR_BGR2LAB)
-            l, a, b = cv2.split(lab)
-            clahe = cv2.createCLAHE(clipLimit=3.5, tileGridSize=(8, 8))
-            cl = clahe.apply(l)
-            merged = cv2.merge((cl, a, b))
-            cv_img = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-        except Exception as e:
-            pass 
-        
-        # Save the heavily enhanced frame to be sent to the AI backend later
-        self.live_frame = cv_img.copy()
-        
+        cv_img = cv2.flip(cv_img, 1)
         h, w = cv_img.shape[:2]
 
-        # 2. Dynamic Real-Time Face Detection & Scoring
-        if self.stack.currentIndex() == 2:
+        gray_frame = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        
+        mean_brightness = np.mean(gray_frame)
+        if mean_brightness < 90:
             try:
-                gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-                # Find faces in the enhanced frame
-                faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(100, 100))
+                lab = cv2.cvtColor(cv_img, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
                 
-                for (x, y, w_face, h_face) in faces:
-                    roi = gray[y:y+h_face, x:x+w_face]
+                clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8)) 
+                cl = clahe.apply(l)
+                merged = cv2.merge((cl, a, b))
+                cv_img = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
+                gray_frame = cl 
+            except Exception:
+                pass 
+        
+        self.live_frame = cv_img.copy()
+
+        # Only run Haar Cascade Face Tracking on Setup Tab OR while Mock Lock Screen is active
+        if self.stack.currentIndex() == 2 or self.is_locking:
+            self.frame_counter += 1
+            
+            if self.frame_counter % 2 == 0:
+                small_gray = cv2.resize(gray_frame, (w // 2, h // 2))
+                
+                faces = self.face_cascade.detectMultiScale(small_gray, scaleFactor=1.1, minNeighbors=6, minSize=(60, 60))
+                
+                if len(faces) > 0:
+                    self.missing_frames = 0 
+                    faces = sorted(faces, key=lambda x: x[2]*x[3], reverse=True)
+                    x, y, w_face, h_face = faces[0]
                     
-                    # Calculate Lighting Quality (Ideal mean pixel intensity is ~130)
+                    x, y, w_face, h_face = x*2, y*2, w_face*2, h_face*2
+                    
+                    if self.last_face_box is None:
+                        self.last_face_box = (x, y, w_face, h_face)
+                    else:
+                        ox, oy, ow, oh = self.last_face_box
+                        self.last_face_box = (
+                            int(0.4 * x + 0.6 * ox),
+                            int(0.4 * y + 0.6 * oy),
+                            int(0.4 * w_face + 0.6 * ow),
+                            int(0.4 * h_face + 0.6 * oh)
+                        )
+                else:
+                    self.missing_frames += 1
+                    if self.missing_frames > 6:
+                        self.last_face_box = None
+
+            if self.last_face_box is not None:
+                x, y, w_face, h_face = self.last_face_box
+                
+                roi = gray_frame[max(0, y):y+h_face, max(0, x):x+w_face]
+                
+                if roi.size > 0:
                     brightness = np.mean(roi)
                     b_score = min(100, (brightness / 130.0) * 100) if brightness < 130 else min(100, ((255 - brightness) / 125.0) * 100)
                     
-                    # Calculate Sharpness (Laplacian Variance)
                     sharpness = cv2.Laplacian(roi, cv2.CV_64F).var()
                     s_score = min(100, (sharpness / 200.0) * 100)
                     
-                    # Weighted Final Visibility Score
                     vis_score = int((b_score * 0.4) + (s_score * 0.6))
                     
-                    # Color code dynamic feedback
                     if vis_score >= 80:
-                        color = (0, 255, 136) # Green
+                        color = (0, 255, 136) 
                         status_txt = f"Visibility: {vis_score}% (OPTIMAL)"
                     elif vis_score >= 50:
-                        color = (0, 200, 255) # Yellow
+                        color = (0, 200, 255) 
                         status_txt = f"Visibility: {vis_score}% (ACCEPTABLE)"
                     else:
-                        color = (0, 0, 255) # Red
+                        color = (0, 0, 255) 
                         status_txt = f"Visibility: {vis_score}% (POOR)"
 
-                    # Draw Target Box
                     cv2.rectangle(cv_img, (x, y), (x+w_face, y+h_face), color, 2)
-                    
-                    # Draw Score Label
                     cv2.rectangle(cv_img, (x, y-30), (x+w_face, y), color, -1)
                     cv2.putText(cv_img, status_txt, (x+5, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-                    
-                    break # We only need to guide the user based on the primary face
-            except Exception as e:
-                print(f"Tracking Error: {e}")
-                pass
 
-            cv2.putText(cv_img, "HD LIVE NEURAL PREVIEW", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 136), 2)
+            label_text = "LIVE AUTHENTICATION FEED" if self.is_locking else "HD LIVE NEURAL PREVIEW"
+            cv2.putText(cv_img, label_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 136), 2)
 
-        # Render to PyQt6
         color_frame = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        qt_img = QImage(color_frame.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+        
+        color_frame = np.ascontiguousarray(color_frame)
+        bytes_per_line = 3 * w
+        
+        qt_img = QImage(color_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
         
         self.target_cam_label.setPixmap(QPixmap.fromImage(qt_img).scaled(
             self.target_cam_label.size(), 
@@ -745,7 +826,7 @@ class CadenceApp(QMainWindow):
         card_layout = QHBoxLayout(card)
         card_layout.setContentsMargins(30, 30, 30, 30)
 
-        self.test_lock_btn = QPushButton("🔒 Test OS Lock Screen")
+        self.test_lock_btn = QPushButton("🔒 Test Cadence Lock Screen")
         self.test_lock_btn.setStyleSheet("""
             QPushButton { background-color: #0055ff; color: white; padding: 12px 24px; 
                           border-radius: 8px; font-weight: bold; font-size: 14px; border: none; }
@@ -762,6 +843,7 @@ class CadenceApp(QMainWindow):
         self.wipe_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.wipe_btn.clicked.connect(self._wipe_system)
         card_layout.addWidget(self.wipe_btn)
+        
         layout.addWidget(card)
 
         test_lbl = QLabel("Test Neural Rhythm Engine (Inline)", objectName="h2")
@@ -781,54 +863,49 @@ class CadenceApp(QMainWindow):
         layout.addStretch()
         return w
 
-    def _launch_mock_lock(self):
-        if not self.is_ai_ready:
-            QMessageBox.warning(self, "AI Untrained", "Please train the Cadence Neural Network before testing the Lock Screen.")
-            return
-        
-        self.start_camera_for_view(QLabel()) 
-        
-        self.lock_screen = MockWindowsLockScreen(self, self)
-        self.lock_screen.exec()
-        
-        self.stop_camera()
-
-    def _force_override(self):
-        self.is_locked = False
-        self.dash_result.setText("System Override Engaged.")
-        self.dash_result.setStyleSheet("color: #ffaa33;")
     def _wipe_system(self):
-        """Physically shreds all local biometric data and resets the AI state."""
         import shutil
-        
-        # 1. Ask for confirmation before destroying data
         reply = QMessageBox.question(self, 'Confirm System Wipe', 
                                      "Are you sure? This will permanently delete your neural keystroke profile and your encrypted face baseline.",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
                                      QMessageBox.StandardButton.No)
                                      
         if reply == QMessageBox.StandardButton.Yes:
-            # 2. Obliterate the database folder from the OS
             model_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "database", "models"))
             if os.path.exists(model_dir):
                 shutil.rmtree(model_dir)
                 
-            # 3. Kill the current AI instances in RAM and generate blank ones
             self.keystroke_engine = CadenceKeystrokeEngine()
             self.face_engine = CadenceFaceEngine()
             
-            # 4. Reset Global Application State
             self.is_ai_ready = False
             self.saved_password = ""
+            self.target_len = 0
             
-            # 5. Update UI to reflect the wiped state
             self.sys_status.setText("● AI UNTRAINED")
             self.sys_status.setStyleSheet("color: #ff3333; font-weight: bold;")
             self.dash_result.setText("System Wiped. All Biometrics Destroyed.")
             self.dash_result.setStyleSheet("color: #ff3333;")
             
-            # 6. Kick the user back to the Rhythm Setup screen
             self.route(1)
+
+    def _launch_mock_lock(self):
+        if not self.is_ai_ready:
+            QMessageBox.warning(self, "AI Untrained", "Please train the Cadence Neural Network before testing the Lock Screen.")
+            return
+        
+        self.is_locking = True
+        self.lock_screen = MockWindowsLockScreen(self, self)
+        self.start_camera_for_view(self.lock_screen.camera_lbl)
+        self.lock_screen.exec()
+        self.is_locking = False
+        self.stop_camera()
+
+    def _force_override(self):
+        self.is_locked = False
+        self.dash_result.setText("System Override Engaged.")
+        self.dash_result.setStyleSheet("color: #ffaa33;")
+
     def _test_login(self):
         typed_pwd = self.dash_test_input.text()
         dts = self.get_dts()
@@ -854,11 +931,9 @@ class CadenceApp(QMainWindow):
                 dts = dts[:self.target_len]
 
             if self.keystroke_engine.is_deep_trained:
-                success = self.keystroke_engine.verify_deep_learning(dts)
-                score = 0.98 if success else 0.15
+                success, score = self.keystroke_engine.verify_deep_learning(dts)
             else:
-                success = self.keystroke_engine.verify_quick_setup(np.array([dts]))
-                score = 0.96 if success else 0.12
+                success, score = self.keystroke_engine.verify_quick_setup(np.array([dts]))
                 
         except Exception as e:
             print(f"Verification Error: {e}")
@@ -1161,7 +1236,12 @@ class CadenceApp(QMainWindow):
 
         self.a_dts.append(dts)
         self._add_session_bar(len(self.a_dts) - 1, keys_pressed, avg_ms)
-        self._set_feedback(f"✅  Capture {len(self.a_dts)}/{self.mx} saved", "ok")
+        
+        if len(self.a_dts) == 1 and self.mx > 1:
+            self._set_feedback(f"✅ Password locked as '{self.saved_password}'. Capture 1/{self.mx} saved.", "ok")
+        else:
+            self._set_feedback(f"✅  Capture {len(self.a_dts)}/{self.mx} saved", "ok")
+            
         self._refresh_session_ui()
 
     def _add_session_bar(self, idx, key_count, avg_ms):
@@ -1228,6 +1308,16 @@ class CadenceApp(QMainWindow):
     def _on_training_done(self, success):
         if success:
             self.is_ai_ready = True
+            
+            # Dynamically retrieve target length immediately after a fresh training run
+            try:
+                if self.keystroke_engine.is_deep_trained:
+                    self.target_len = self.keystroke_engine.lstm_model.input_shape[1]
+                elif self.keystroke_engine.is_quick_trained:
+                    self.target_len = self.keystroke_engine.svm_model.n_features_in_
+            except Exception:
+                pass
+                
             self.train_btn.setText("✅  Training Complete")
             self.train_status.setText("Model saved. Neural network is now active.")
             self.train_status.setStyleSheet("color: #00cc55; font-size: 11px; background: transparent;")
