@@ -4,29 +4,52 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # Mutes TensorFlow C++ hardware warnin
 
 import numpy as np
 import math
+from contextlib import nullcontext
 import joblib
 from sklearn.svm import OneClassSVM
 from sklearn.preprocessing import StandardScaler
+from database.db_manager import DatabaseManager
 
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR')         # Mutes TensorFlow Python deprecation warnings
-from tensorflow import keras # type: ignore
-from keras.models import Sequential
-from keras.layers import LSTM, Dense, Dropout
+TF_AVAILABLE = True
+try:
+    import tensorflow as tf
+    tf.get_logger().setLevel('ERROR')         # Mutes TensorFlow Python deprecation warnings
+    from tensorflow import keras # type: ignore
+    from keras.models import Sequential
+    from keras.layers import LSTM, Dense, Dropout
+    from keras.callbacks import EarlyStopping
+except Exception:
+    try:
+        import keras # type: ignore
+        tf = None
+        from keras.models import Sequential
+        from keras.layers import LSTM, Dense, Dropout
+        from keras.callbacks import EarlyStopping
+    except Exception:
+        TF_AVAILABLE = False
+        tf = None
+        keras = None
+        Sequential = None
+        LSTM = None
+        Dense = None
+        Dropout = None
+        EarlyStopping = None
 
 class CadenceKeystrokeEngine:
-    def __init__(self):
-        self.model_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "database", "models"))
+    def __init__(self, profile_name="default"):
+        self.db = DatabaseManager()
+        self.db.set_active_profile(profile_name, create_if_missing=True)
+        self.model_dir = self.db.get_model_dir()
         os.makedirs(self.model_dir, exist_ok=True)
         
         # 'scale' dynamically adapts the kernel to the variance of your specific typing
         self.svm_model = OneClassSVM(kernel='rbf', gamma='scale', nu=0.05)
         self.scaler = StandardScaler()
-        self.lstm_model = self._build_lstm_model()
+        self.lstm_model = self._build_lstm_model() if TF_AVAILABLE else None
         
-        self.svm_path = os.path.join(self.model_dir, "keystroke_svm.pkl")
-        self.scaler_path = os.path.join(self.model_dir, "keystroke_scaler.pkl")
-        self.lstm_path = os.path.join(self.model_dir, "keystroke_lstm.keras")
+        self.svm_path = os.path.join(self.model_dir, "keystroke_svm.pkl.enc")
+        self.scaler_path = os.path.join(self.model_dir, "keystroke_scaler.pkl.enc")
+        self.lstm_path = os.path.join(self.model_dir, "keystroke_lstm.keras.enc")
         
         self.is_quick_trained = False
         self.is_deep_trained = False
@@ -34,6 +57,8 @@ class CadenceKeystrokeEngine:
         self._load_models()
 
     def _build_lstm_model(self):
+        if not TF_AVAILABLE or Sequential is None:
+            raise RuntimeError("TensorFlow is unavailable in this environment.")
         model = Sequential([
             LSTM(64, input_shape=(None, 1), return_sequences=True),
             Dropout(0.2),
@@ -45,20 +70,84 @@ class CadenceKeystrokeEngine:
         return model
 
     def _load_models(self):
+        legacy_svm = os.path.join(self.model_dir, "keystroke_svm.pkl")
+        legacy_scaler = os.path.join(self.model_dir, "keystroke_scaler.pkl")
         if os.path.exists(self.svm_path) and os.path.exists(self.scaler_path):
-            self.svm_model = joblib.load(self.svm_path)
-            self.scaler = joblib.load(self.scaler_path)
+            try:
+                self.svm_model = self.db.load_model("keystroke_svm.pkl.enc")
+                self.scaler = self.db.load_model("keystroke_scaler.pkl.enc")
+                self.is_quick_trained = True
+            except Exception:
+                pass
+        elif os.path.exists(legacy_svm) and os.path.exists(legacy_scaler):
+            self.svm_model = joblib.load(legacy_svm)
+            self.scaler = joblib.load(legacy_scaler)
             self.is_quick_trained = True
             
-        if os.path.exists(self.lstm_path):
-            self.lstm_model = keras.models.load_model(self.lstm_path)
+        legacy_lstm = os.path.join(self.model_dir, "keystroke_lstm.keras")
+        if TF_AVAILABLE and os.path.exists(self.lstm_path):
+            try:
+                self.lstm_model = self.db.load_keras_model("keystroke_lstm.keras.enc", keras.models.load_model)
+                self.is_deep_trained = True
+            except Exception:
+                pass
+        elif TF_AVAILABLE and os.path.exists(legacy_lstm):
+            self.lstm_model = keras.models.load_model(legacy_lstm)
             self.is_deep_trained = True
 
+    def _validate_sequences(self, sequences):
+        data = np.asarray(sequences, dtype=float)
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        if data.size == 0:
+            raise ValueError("Timing sequence is empty.")
+        if not np.all(np.isfinite(data)):
+            raise ValueError("Timing sequence contains invalid values.")
+        if np.any(data <= 0):
+            raise ValueError("Timing sequence contains impossible zero/negative intervals.")
+        return data
+
+    def _reject_outliers(self, data):
+        if len(data) < 4:
+            return data
+
+        row_medians = np.median(data, axis=1)
+        median = np.median(row_medians)
+        mad = np.median(np.abs(row_medians - median))
+        if mad == 0:
+            return data
+
+        robust_z = 0.6745 * (row_medians - median) / mad
+        filtered = data[np.abs(robust_z) <= 3.5]
+        return filtered if len(filtered) >= max(3, len(data) // 2) else data
+
+    def _make_synthetic_impostors(self, sequences):
+        rng = np.random.default_rng(42)
+        impostors = []
+        for seq in sequences:
+            fake = np.array(seq, dtype=float).copy()
+            rng.shuffle(fake)
+            fake *= rng.uniform(0.5, 1.5)
+            fake += rng.normal(0.0, 0.01, size=fake.shape)
+            fake = np.clip(fake, 1e-4, None)
+            impostors.append(fake)
+        return np.asarray(impostors, dtype=float)
+
+    def _augment_genuine_sequences(self, sequences, variants=5):
+        rng = np.random.default_rng(7)
+        augmented = []
+        for seq in sequences:
+            base = np.array(seq, dtype=float)
+            augmented.append(base)
+            for _ in range(variants):
+                jitter = rng.uniform(-0.01, 0.01, size=base.shape)
+                noisy = np.clip(base + jitter, 1e-4, None)
+                augmented.append(noisy)
+        return np.asarray(augmented, dtype=float)
+
     def train_quick_setup(self, dwell_flight_data):
-        if len(dwell_flight_data) == 0:
-            return False
-            
-        raw_data = np.array(dwell_flight_data)
+        raw_data = self._validate_sequences(dwell_flight_data)
+        raw_data = self._reject_outliers(raw_data)
         
         # Gaussian Micro-Jitter: Prevents Kernel Collapse by simulating minor typing flaws
         noise = np.random.normal(0, 0.001, raw_data.shape)
@@ -67,8 +156,8 @@ class CadenceKeystrokeEngine:
         scaled_data = self.scaler.fit_transform(robust_data)
         self.svm_model.fit(scaled_data)
         
-        joblib.dump(self.svm_model, self.svm_path)
-        joblib.dump(self.scaler, self.scaler_path)
+        self.db.save_model("keystroke_svm.pkl.enc", self.svm_model)
+        self.db.save_model("keystroke_scaler.pkl.enc", self.scaler)
         
         self.is_quick_trained = True
         return True
@@ -77,50 +166,60 @@ class CadenceKeystrokeEngine:
         if not self.is_quick_trained:
             raise ValueError("Quick setup model is not trained yet.")
             
-        sequence = np.array(sequence)
-        if len(sequence.shape) == 1:
-            sequence = sequence.reshape(1, -1)
+        sequence = self._validate_sequences(sequence)
             
         scaled_seq = self.scaler.transform(sequence)
-        distance = self.svm_model.decision_function(scaled_seq)[0]
-        
-        # ========================================================
-        # NEW FIX: The Forgiving Human Mapping
-        # ========================================================
-        if distance >= 0:
-            # Perfect Machine-Like Match (Score: 0.90 to 0.99)
-            score = 0.90 + (0.09 * min(distance, 1.0))
-            
-        elif distance >= -2.0:
-            # Human Variance Zone. The AI recognizes you are close but slightly off.
-            # A minor deviation (e.g., -0.2 distance) results in ~0.86 (Fast-Path Pass)
-            # A moderate deviation (e.g., -0.8 distance) results in ~0.74 (Wakes Camera)
-            score = 0.50 + (0.40 * (1.0 - (abs(distance) / 2.0)))
-            
-        else:
-            # Severe Deviation / Imposter Zone (Score: 0.0 to 0.49)
-            score = max(0.0, 0.49 - (abs(distance) * 0.1))
-            
-        success = score >= 0.85
+        preds = self.svm_model.predict(scaled_seq)
+        score = float(np.mean(preds == 1))
+        success = score >= 0.5
         return success, float(score)
 
     def train_deep_learning(self, sequences, labels, epochs=15):
-        with tf.device('/CPU:0'):
-            sequences = np.array(sequences)
-            if len(sequences.shape) == 2:
-                sequences = np.expand_dims(sequences, axis=-1) 
-            self.lstm_model.fit(sequences, labels, epochs=epochs, batch_size=1, verbose=1)
-            
-        self.lstm_model.save(self.lstm_path)
+        if not TF_AVAILABLE or self.lstm_model is None or tf is None:
+            raise ValueError("Deep learning setup unavailable: TensorFlow runtime is not available.")
+
+        with (tf.device('/CPU:0') if tf is not None else nullcontext()):
+            genuine = self._validate_sequences(sequences)
+            if len(genuine) < 8:
+                raise ValueError("Deep learning setup requires at least 8 genuine captures.")
+
+            augmented = self._augment_genuine_sequences(genuine, variants=5)
+            impostors = self._make_synthetic_impostors(augmented)
+
+            train_x = np.concatenate([augmented, impostors], axis=0)
+            train_y = np.concatenate([np.ones(len(augmented)), np.zeros(len(impostors))], axis=0)
+
+            perm = np.random.default_rng(21).permutation(len(train_x))
+            train_x = train_x[perm]
+            train_y = train_y[perm]
+
+            train_x = np.expand_dims(train_x, axis=-1)
+            callbacks = [
+                EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True)
+            ]
+
+            self.lstm_model.fit(
+                train_x,
+                train_y,
+                epochs=epochs,
+                batch_size=max(8, min(32, len(train_x) // 8)),
+                validation_split=0.2,
+                callbacks=callbacks,
+                verbose=0,
+            )
+
+        self.db.save_keras_model("keystroke_lstm.keras.enc", self.lstm_model)
         self.is_deep_trained = True
         return True
 
     def verify_deep_learning(self, sequence):
+        if not TF_AVAILABLE or self.lstm_model is None or tf is None:
+            raise ValueError("Deep learning setup unavailable: TensorFlow runtime is not available.")
         if not self.is_deep_trained:
             raise ValueError("Deep learning model is not trained yet.")
             
-        with tf.device('/CPU:0'):
-            sequence = np.array(sequence)
+        with (tf.device('/CPU:0') if tf is not None else nullcontext()):
+            sequence = self._validate_sequences(sequence)
             if len(sequence.shape) == 1:
                 sequence = sequence.reshape(1, -1, 1)
             elif len(sequence.shape) == 2:

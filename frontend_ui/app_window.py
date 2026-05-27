@@ -7,22 +7,35 @@ import math
 import gc
 import stat
 import shutil
+import json
 import urllib.request
 import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QStackedWidget, QLineEdit, 
                              QProgressBar, QFrame, QGridLayout, QSizePolicy,
                              QPushButton, QButtonGroup, QTextEdit, QScrollArea, QCheckBox,
-                             QDialog, QMessageBox, QInputDialog)
+                             QDialog, QMessageBox, QInputDialog, QComboBox, QGraphicsBlurEffect)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer, QRect, QDateTime
-from PyQt6.QtGui import QImage, QPixmap, QFont, QKeyEvent, QPainter, QColor, QBrush, QPen, QCursor
+from PyQt6.QtGui import QImage, QPixmap, QKeyEvent, QCursor
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from core_ai.keystroke_ai import CadenceKeystrokeEngine
 from core_ai.face_ai import CadenceFaceEngine
 from database.db_manager import DatabaseManager
+from frontend_ui.custom_widgets import TimingChart
 
-os.makedirs("intruders", exist_ok=True)
+INTRUDER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intruders"))
+os.makedirs(INTRUDER_DIR, exist_ok=True)
+
+try:
+    from tensorflow import keras as tf_keras  # type: ignore
+    KERAS_BACKEND = tf_keras.backend
+except Exception:
+    try:
+        import keras as standalone_keras  # type: ignore
+        KERAS_BACKEND = standalone_keras.backend
+    except Exception:
+        KERAS_BACKEND = None
 
 class AITaskThread(QThread):
     result_signal = pyqtSignal(object)
@@ -40,33 +53,6 @@ class AITaskThread(QThread):
             self.result_signal.emit(res)
         except Exception as e:
             self.error_signal.emit(str(e))
-
-class TimingChart(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(45)
-        self.data = []
-    def update_data(self, new_data):
-        self.data = new_data
-        self.update()
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 0))
-        if not self.data: return
-        bar_width = 15
-        spacing = 5
-        max_height = self.height() - 10
-        max_val = max(500, max(self.data) if self.data else 500)
-        x_offset = 10
-        for val in self.data[-30:]:
-            h = int((val / max_val) * max_height)
-            h = max(5, h)
-            y = self.height() - h - 5
-            painter.setBrush(QBrush(QColor("#00ff88")))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(x_offset, y, bar_width, h)
-            x_offset += bar_width + spacing
 
 class SessionBar(QFrame):
     def __init__(self, index, key_count, avg_ms):
@@ -186,6 +172,35 @@ class CameraThread(QThread):
         self.running = False
         self.wait()
 
+class BackgroundVerifyThread(QThread):
+    verification_signal = pyqtSignal(bool)
+
+    def __init__(self, face_engine, frame_provider, interval_seconds=15):
+        super().__init__()
+        self.face_engine = face_engine
+        self.frame_provider = frame_provider
+        self.interval_seconds = max(5, int(interval_seconds))
+        self.running = True
+
+    def run(self):
+        while self.running:
+            frame = self.frame_provider()
+            if frame is not None and self.face_engine.is_enrolled:
+                try:
+                    verified = bool(self.face_engine.verify_user(frame.copy()))
+                except Exception:
+                    verified = False
+                self.verification_signal.emit(verified)
+
+            for _ in range(self.interval_seconds * 10):
+                if not self.running:
+                    break
+                self.msleep(100)
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
 class MockWindowsLockScreen(QDialog):
     def __init__(self, parent=None, app_instance=None):
         super().__init__(parent)
@@ -219,6 +234,15 @@ class MockWindowsLockScreen(QDialog):
         center_layout = QVBoxLayout()
         center_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
         center_layout.setSpacing(20)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Profile:"))
+        self.profile_select = QComboBox()
+        self.profile_select.addItems(self.app.db.list_profiles())
+        self.profile_select.setCurrentText(self.app.active_profile)
+        self.profile_select.currentTextChanged.connect(self._on_profile_changed)
+        profile_row.addWidget(self.profile_select)
+        profile_row.addStretch()
+        center_layout.addLayout(profile_row)
         self.camera_lbl = QLabel()
         self.camera_lbl.setFixedSize(400, 300)
         self.camera_lbl.setStyleSheet("border: 2px solid #00ff88; border-radius: 8px; background-color: #0f0f0f;")
@@ -270,6 +294,11 @@ class MockWindowsLockScreen(QDialog):
         bottom_layout.addWidget(self.cancel_btn)
         main_layout.addLayout(bottom_layout)
 
+    def _on_profile_changed(self, profile_name):
+        if profile_name and profile_name != self.app.active_profile:
+            self.app._switch_profile(profile_name)
+            self.target_len = self.app.target_len if self.app.target_len > 0 else 5
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             event.ignore()
@@ -315,15 +344,14 @@ class MockWindowsLockScreen(QDialog):
         
         self.pwd_input.setReadOnly(True)
         
-        if typed_pwd != self.app.saved_password:
+        if not self.app._password_matches(typed_pwd):
             self._fail("ACCESS DENIED: Invalid Rhythm.")
             return
 
-        pad_len = self.target_len - len(dts)
-        if pad_len > 0:
-            dts.extend([0.0] * pad_len)
-        elif pad_len < 0:
-            dts = dts[:self.target_len]
+        dts = self.app._normalize_timing_sequence(dts, self.target_len)
+        if dts is None:
+            self._fail("ACCESS DENIED: Inconsistent rhythm length. Re-type password.")
+            return
 
         try:
             success, score = self.app.keystroke_engine.verify_quick_setup(np.array([dts]))
@@ -437,9 +465,15 @@ class CadenceApp(QMainWindow):
         self.face_net = cv2.dnn.readNetFromCaffe(self.prototxt_path, self.caffemodel_path)
         
         self.db = DatabaseManager()
-        self.keystroke_engine = CadenceKeystrokeEngine()
-        self.face_engine = CadenceFaceEngine()
+        self.active_profile = self.db.get_active_profile()
+        self.keystroke_engine = CadenceKeystrokeEngine(self.active_profile)
+        self.face_engine = CadenceFaceEngine(self.active_profile)
         self.camera_thread = None
+        self.background_verify_thread = None
+        self.reverify_mode = "off"
+        self.reverify_failures = 0
+        self.soft_locked = False
+        self.outlier_reject_count = 0
         
         self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         
@@ -448,15 +482,15 @@ class CadenceApp(QMainWindow):
         self.missing_frames = 0 
         self.is_locked = False
         self.is_locking = False  
-        self.saved_password = ""
-        self.is_ai_ready = self.keystroke_engine.is_quick_trained or self.keystroke_engine.is_deep_trained
+        self.pending_password = ""
+        self.is_ai_ready = (self.keystroke_engine.is_quick_trained or self.keystroke_engine.is_deep_trained) and self.db.has_password()
         self.st = 'idl'          
         self.tms = []            
         self.flight_times = []   
         self.a_dts = []          
         self.e_dts = []          
         self.mx = 5              
-        self.target_len = 0
+        self.target_len = self.db.get_target_len()
         
         if self.is_ai_ready:
             try:
@@ -465,7 +499,8 @@ class CadenceApp(QMainWindow):
                 elif self.keystroke_engine.is_quick_trained:
                     self.target_len = self.keystroke_engine.svm_model.n_features_in_
             except Exception:
-                pass
+                if self.db.get_target_len() > 0:
+                    self.target_len = self.db.get_target_len()
         self.esy_str = ("the quick brown fox jumps\nover the lazy sleeping dog\npack my box with five dozen\nliquor jugs and wave goodbye\nsecurity starts with good habits")
         self.typd = ""
         self.hover_ticks = 0
@@ -500,6 +535,100 @@ class CadenceApp(QMainWindow):
         if self.camera_thread and self.camera_thread.isRunning():
             self.camera_thread.stop()
             self.camera_thread = None
+
+    def _current_live_frame(self):
+        if hasattr(self, "live_frame"):
+            return self.live_frame
+        return None
+
+    def _set_reverify_mode(self, mode):
+        self.reverify_mode = mode
+        self.reverify_failures = 0
+        self._start_background_verify()
+
+    def _get_reverify_failure_limit(self):
+        return {"off": None, "low": 5, "high": 2}.get(self.reverify_mode, None)
+
+    def _start_background_verify(self):
+        self._stop_background_verify()
+        limit = self._get_reverify_failure_limit()
+        if limit is None or not self.is_ai_ready or not self.face_engine.is_enrolled:
+            return
+        self.background_verify_thread = BackgroundVerifyThread(self.face_engine, self._current_live_frame, interval_seconds=15)
+        self.background_verify_thread.verification_signal.connect(self._on_background_verification)
+        self.background_verify_thread.start()
+
+    def _stop_background_verify(self):
+        if self.background_verify_thread and self.background_verify_thread.isRunning():
+            self.background_verify_thread.stop()
+        self.background_verify_thread = None
+
+    def _on_background_verification(self, verified):
+        if verified:
+            self.reverify_failures = 0
+            return
+
+        limit = self._get_reverify_failure_limit()
+        if limit is None:
+            return
+
+        self.reverify_failures += 1
+        if self.reverify_failures >= limit:
+            self._trigger_soft_lockout()
+
+    def _set_soft_lock_visual(self, is_locked):
+        effect = self.centralWidget().graphicsEffect()
+        if is_locked:
+            if not isinstance(effect, QGraphicsBlurEffect):
+                blur = QGraphicsBlurEffect(self)
+                blur.setBlurRadius(8)
+                self.centralWidget().setGraphicsEffect(blur)
+        else:
+            self.centralWidget().setGraphicsEffect(None)
+
+    def _trigger_soft_lockout(self):
+        if self.soft_locked:
+            return
+        self.soft_locked = True
+        self._stop_background_verify()
+        self._set_soft_lock_visual(True)
+        self.dash_result.setText("⚠️ Continuous verification failed. Re-authentication required.")
+        self.dash_result.setStyleSheet("color: #ffaa33;")
+        self._launch_mock_lock()
+
+    def _switch_profile(self, profile_name):
+        self._stop_background_verify()
+        self.stop_camera()
+        self.db.set_active_profile(profile_name, create_if_missing=True)
+        self.active_profile = self.db.get_active_profile()
+
+        self.keystroke_engine = CadenceKeystrokeEngine(self.active_profile)
+        self.face_engine = CadenceFaceEngine(self.active_profile)
+
+        self.is_ai_ready = (self.keystroke_engine.is_quick_trained or self.keystroke_engine.is_deep_trained) and self.db.has_password()
+        self.target_len = self.db.get_target_len()
+        self.pending_password = ""
+        self.reverify_failures = 0
+
+        self.sys_status.setText("● AI READY" if self.is_ai_ready else "● AI UNTRAINED")
+        self.sys_status.setStyleSheet(f"color: {'#00ff88' if self.is_ai_ready else '#ff3333'}; font-weight: bold;")
+        self.route(0 if self.is_ai_ready else 1)
+
+    def _on_profile_changed(self, profile_name):
+        if profile_name and profile_name != self.active_profile:
+            self._switch_profile(profile_name)
+
+    def _create_profile(self):
+        name, ok = QInputDialog.getText(self, "Create Profile", "Enter new profile name:")
+        if not ok or not name.strip():
+            return
+        self.db.create_profile(name.strip())
+        self.profile_select.blockSignals(True)
+        self.profile_select.clear()
+        self.profile_select.addItems(self.db.list_profiles())
+        self.profile_select.setCurrentText(name.strip())
+        self.profile_select.blockSignals(False)
+        self._switch_profile(name.strip())
 
     def _check_taskbar_hover(self):
         if self.isFullScreen() and self.isActiveWindow():
@@ -601,8 +730,43 @@ class CadenceApp(QMainWindow):
         self.tms.clear()
         self.flight_times.clear()
 
+    def _password_matches(self, typed_password):
+        return self.db.verify_password(typed_password)
+
+    def _normalize_timing_sequence(self, dts, target_len):
+        if target_len <= 0:
+            return list(dts)
+        if len(dts) != target_len:
+            return None
+        if any(dt <= 0 for dt in dts):
+            return None
+        return list(dts)
+
+    def _record_intruder_attempt(self, reason, typed_password="", timings=None, source="dashboard"):
+        os.makedirs(INTRUDER_DIR, exist_ok=True)
+        stamp = QDateTime.currentDateTime().toString("yyyyMMdd_HHmmss_zzz")
+        timings = timings or []
+        metadata = {
+            "timestamp": QDateTime.currentDateTime().toString(Qt.DateFormat.ISODate),
+            "source": source,
+            "reason": reason,
+            "typed_length": len(typed_password or ""),
+            "timing_count": len(timings),
+            "timings_ms": [round(dt * 1000, 3) for dt in timings],
+        }
+
+        json_path = os.path.join(INTRUDER_DIR, f"{stamp}_{source}.json")
+        with open(json_path, "w") as f:
+            json.dump(metadata, f, indent=4)
+
+        if hasattr(self, "live_frame"):
+            image_path = os.path.join(INTRUDER_DIR, f"{stamp}_{source}.jpg")
+            cv2.imwrite(image_path, self.live_frame)
+
     def route(self, index):
         self.stop_camera()
+        if index != 0:
+            self._stop_background_verify()
         self.stack.setCurrentIndex(index)
         self.card_rhythm.set_active(index == 1)
         self.card_face.set_active(index == 2)
@@ -611,6 +775,8 @@ class CadenceApp(QMainWindow):
             self.clr_trk()
             self.dash_test_input.clear()
             self.dash_test_input.setFocus()
+            self.start_camera_for_view(self.face_cam_label)
+            self._start_background_verify()
         elif index == 1:
             self._reset_ui()
         elif index == 2:
@@ -798,6 +964,32 @@ class CadenceApp(QMainWindow):
         layout.setSpacing(25)
         title = QLabel("System Dashboard", objectName="h1")
         layout.addWidget(title)
+
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Active Profile:"))
+        self.profile_select = QComboBox()
+        self.profile_select.addItems(self.db.list_profiles())
+        self.profile_select.setCurrentText(self.active_profile)
+        self.profile_select.currentTextChanged.connect(self._on_profile_changed)
+        profile_row.addWidget(self.profile_select)
+        self.new_profile_btn = QPushButton("+ New Profile")
+        self.new_profile_btn.setObjectName("ghost_btn")
+        self.new_profile_btn.clicked.connect(self._create_profile)
+        profile_row.addWidget(self.new_profile_btn)
+        profile_row.addStretch()
+        layout.addLayout(profile_row)
+
+        reverify_row = QHBoxLayout()
+        reverify_row.addWidget(QLabel("Continuous Face Re-Verify:"))
+        self.reverify_select = QComboBox()
+        self.reverify_select.addItems(["Off", "Low", "High"])
+        self.reverify_select.currentTextChanged.connect(
+            lambda v: self._set_reverify_mode(v.lower())
+        )
+        reverify_row.addWidget(self.reverify_select)
+        reverify_row.addStretch()
+        layout.addLayout(reverify_row)
+
         card = QFrame()
         card.setObjectName("dash_card")
         card.setStyleSheet("QFrame#dash_card { background-color: #151515; border: 1px solid #333; border-radius: 8px; }")
@@ -837,7 +1029,6 @@ class CadenceApp(QMainWindow):
         import gc
         import time
         import stat
-        from tensorflow.keras import backend as K
         
         reply = QMessageBox.question(self, 'Confirm System Wipe', 
                                      "Are you sure? This will permanently delete your neural keystroke profile and your encrypted face baseline.",
@@ -848,12 +1039,14 @@ class CadenceApp(QMainWindow):
             self.face_engine = None
             self.db = None
             
-            K.clear_session()
+            if KERAS_BACKEND is not None:
+                KERAS_BACKEND.clear_session()
             gc.collect()
             time.sleep(0.5) 
             
             base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
             models_dir = os.path.join(base_dir, "database", "models")
+            profiles_dir = os.path.join(base_dir, "database", "profiles")
             
             if os.path.exists(models_dir): 
                 for root, dirs, files in os.walk(models_dir, topdown=False):
@@ -876,6 +1069,10 @@ class CadenceApp(QMainWindow):
                 except OSError:
                     pass
 
+            active_profile_dir = os.path.join(profiles_dir, self.active_profile)
+            if os.path.exists(active_profile_dir):
+                shutil.rmtree(active_profile_dir, ignore_errors=True)
+
             for root, dirs, files in os.walk(base_dir, topdown=False):
                 for name in dirs:
                     if name == "__pycache__":
@@ -883,11 +1080,12 @@ class CadenceApp(QMainWindow):
                         shutil.rmtree(cache_dir, ignore_errors=True)
             
             self.db = DatabaseManager()
-            self.keystroke_engine = CadenceKeystrokeEngine()
-            self.face_engine = CadenceFaceEngine()
+            self.active_profile = self.db.get_active_profile()
+            self.keystroke_engine = CadenceKeystrokeEngine(self.active_profile)
+            self.face_engine = CadenceFaceEngine(self.active_profile)
             
             self.is_ai_ready = False
-            self.saved_password = ""
+            self.pending_password = ""
             self.target_len = 0
             
             self.sys_status.setText("● AI UNTRAINED")
@@ -898,6 +1096,13 @@ class CadenceApp(QMainWindow):
             uid_lbl = self.findChild(QLabel, "uid_label")
             if uid_lbl:
                 uid_lbl.setText(self.db.get_device_uid())
+
+            if hasattr(self, "profile_select"):
+                self.profile_select.blockSignals(True)
+                self.profile_select.clear()
+                self.profile_select.addItems(self.db.list_profiles())
+                self.profile_select.setCurrentText(self.active_profile)
+                self.profile_select.blockSignals(False)
             
             self.route(1)
             self._set_feedback("System wiped successfully. RAM and PyCache cleared.", "ok")
@@ -906,12 +1111,18 @@ class CadenceApp(QMainWindow):
         if not self.is_ai_ready:
             QMessageBox.warning(self, "AI Untrained", "Please train the Cadence Neural Network before testing the Lock Screen.")
             return
+        self._stop_background_verify()
         self.is_locking = True
         self.lock_screen = MockWindowsLockScreen(self, self)
         self.start_camera_for_view(self.lock_screen.camera_lbl)
-        self.lock_screen.exec()
+        result = self.lock_screen.exec()
         self.is_locking = False
         self.stop_camera()
+        if result == QDialog.DialogCode.Accepted:
+            self.soft_locked = False
+            self.reverify_failures = 0
+            self._set_soft_lock_visual(False)
+            self._start_background_verify()
 
     def _test_login(self):
         typed_pwd = self.dash_test_input.text()
@@ -928,33 +1139,60 @@ class CadenceApp(QMainWindow):
             self.dash_test_input.setFocus()
             return
             
-        if typed_pwd != self.saved_password:
+        if not self._password_matches(typed_pwd):
             self.dash_result.setText("❌ ACCESS DENIED (Invalid Password)")
             self.dash_result.setStyleSheet("color: #ff3333;")
+            self._record_intruder_attempt("password_mismatch", typed_pwd, dts, "dashboard")
             self.clr_trk()
             self.dash_test_input.setReadOnly(False)
             self.dash_test_input.setFocus()
             return
-            
-        pad_len = self.target_len - len(dts)
-        if pad_len > 0: dts.extend([0.0] * pad_len)
-        elif pad_len < 0: dts = dts[:self.target_len]
+
+        dts = self._normalize_timing_sequence(dts, self.target_len)
+        if dts is None:
+            self.dash_result.setText("❌ ACCESS DENIED (Inconsistent timing capture length)")
+            self.dash_result.setStyleSheet("color: #ff3333;")
+            self._record_intruder_attempt("timing_length_mismatch", typed_pwd, self.get_dts(), "dashboard")
+            self.clr_trk()
+            self.dash_test_input.setReadOnly(False)
+            self.dash_test_input.setFocus()
+            return
         
         try:
-            success, score = self.keystroke_engine.verify_quick_setup(np.array([dts]))
+            quick_ok, quick_score = self.keystroke_engine.verify_quick_setup(np.array([dts]))
         except Exception as e:
             self.dash_result.setText(f"Verification Error: {e}")
             self.clr_trk()
             self.dash_test_input.setReadOnly(False)
             self.dash_test_input.setFocus()
             return
-            
-        if score <= 0.45:
-            self.dash_result.setText(f"❌ ACCESS DENIED (Score: {score:.2f} via SVM Fast-Path)")
-            self.dash_result.setStyleSheet("color: #ff3333;")
-        else:
-            self.dash_result.setText(f"✅ RHYTHM PASSED (Score: {score:.2f}). Proceeding to Face Check...")
+
+        if quick_ok:
+            self.dash_result.setText(f"✅ RHYTHM PASSED (Quick score: {quick_score:.2f}). Proceeding to Face Check...")
             self.dash_result.setStyleSheet("color: #00ff88;")
+        elif self.keystroke_engine.is_deep_trained:
+            try:
+                deep_ok, deep_score = self.keystroke_engine.verify_deep_learning(dts)
+            except Exception as e:
+                self.dash_result.setText(f"❌ ACCESS DENIED (Quick score: {quick_score:.2f}; Deep error: {e})")
+                self.dash_result.setStyleSheet("color: #ff3333;")
+                self._record_intruder_attempt("keystroke_mismatch", typed_pwd, dts, "dashboard")
+                self.clr_trk()
+                self.dash_test_input.setReadOnly(False)
+                self.dash_test_input.setFocus()
+                return
+
+            if deep_ok:
+                self.dash_result.setText(f"✅ RHYTHM PASSED (Quick: {quick_score:.2f}, Deep: {deep_score:.2f})")
+                self.dash_result.setStyleSheet("color: #00ff88;")
+            else:
+                self.dash_result.setText(f"❌ ACCESS DENIED (Quick: {quick_score:.2f}, Deep: {deep_score:.2f})")
+                self.dash_result.setStyleSheet("color: #ff3333;")
+                self._record_intruder_attempt("keystroke_mismatch", typed_pwd, dts, "dashboard")
+        else:
+            self.dash_result.setText(f"❌ ACCESS DENIED (Quick score: {quick_score:.2f})")
+            self.dash_result.setStyleSheet("color: #ff3333;")
+            self._record_intruder_attempt("keystroke_mismatch", typed_pwd, dts, "dashboard")
             
         self.clr_trk()
         self.dash_test_input.setReadOnly(False)
@@ -1022,12 +1260,17 @@ class CadenceApp(QMainWindow):
         lbl_sess = QLabel("SESSIONS CAPTURED"); lbl_sess.setObjectName("sub")
         self.stat_sess = QLabel("0")
         self.stat_sess.setStyleSheet("color: #00ff88; font-size: 20px; font-weight: bold; background: transparent;")
+        lbl_rej = QLabel("OUTLIERS REJECTED"); lbl_rej.setObjectName("sub")
+        self.stat_rej = QLabel("0")
+        self.stat_rej.setStyleSheet("color: #ffaa33; font-size: 20px; font-weight: bold; background: transparent;")
         grid.addWidget(lbl_avg, 0, 0)
         grid.addWidget(self.stat_avg, 1, 0)
         grid.addWidget(lbl_keys, 0, 1)
         grid.addWidget(self.stat_keys, 1, 1)
         grid.addWidget(lbl_sess, 0, 2)
         grid.addWidget(self.stat_sess, 1, 2)
+        grid.addWidget(lbl_rej, 0, 3)
+        grid.addWidget(self.stat_rej, 1, 3)
         root.addLayout(grid)
         lbl_chart = QLabel("TIMING PATTERN"); lbl_chart.setObjectName("sub")
         root.addWidget(lbl_chart)
@@ -1082,8 +1325,9 @@ class CadenceApp(QMainWindow):
         self.mx = 5
         self.a_dts = []
         self.e_dts = []
+        self.outlier_reject_count = 0
         self.typd = ""
-        self.saved_password = ""
+        self.pending_password = ""
         self.clr_trk()
         self.btn_q.set_active(False)
         self.btn_d.set_active(False)
@@ -1096,6 +1340,7 @@ class CadenceApp(QMainWindow):
         self.rhythm_input.clear()
         self.stat_avg.setText("--")
         self.stat_keys.setText("--")
+        self.stat_rej.setText("0")
         self.timing_chart.update_data([])
         self._set_feedback("")
         while self.session_list_layout.count() > 1:
@@ -1108,7 +1353,8 @@ class CadenceApp(QMainWindow):
             self.mx = 5
             self.a_dts = []
             self.e_dts = []
-            self.saved_password = ""
+            self.outlier_reject_count = 0
+            self.pending_password = ""
             while self.session_list_layout.count() > 1:
                 item = self.session_list_layout.takeAt(0)
                 if item.widget(): item.widget().deleteLater()
@@ -1128,11 +1374,15 @@ class CadenceApp(QMainWindow):
         self._refresh_session_ui()
 
     def _start_dp(self):
+        if self.keystroke_engine.lstm_model is None:
+            self._set_feedback("Deep setup unavailable: TensorFlow backend is not available in this environment.", "warning")
+            return
         self.st = 'dp'
-        self.mx = 1
+        self.mx = 8
         self.a_dts = []
         self.e_dts = []
-        self.saved_password = ""
+        self.outlier_reject_count = 0
+        self.pending_password = ""
         while self.session_list_layout.count() > 1:
             item = self.session_list_layout.takeAt(0)
             if item.widget(): item.widget().deleteLater()
@@ -1173,11 +1423,11 @@ class CadenceApp(QMainWindow):
 
     def _fin_esy(self):
         self.e_dts = self.get_dts()
-        self.mx = 1
+        self.mx = 8
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Phase 1 Complete")
         msg_box.setText("Baseline Essay Captured Successfully!")
-        msg_box.setInformativeText("The LSTM Network has captured your raw neural rhythm. Please click OK to define the actual password you will use to log in.")
+        msg_box.setInformativeText("The LSTM baseline is captured. Click OK, then enter your password rhythm at least 8 times for deep training.")
         msg_box.setIcon(QMessageBox.Icon.Information)
         msg_box.setStyleSheet("QMessageBox { background-color: #111; color: white; } QLabel { color: white; } QPushButton { background-color: #00ff88; color: black; padding: 5px 15px; font-weight: bold; }")
         msg_box.exec()
@@ -1198,21 +1448,39 @@ class CadenceApp(QMainWindow):
             if len(typed) < 4:
                 self._set_feedback("⚠️ Password must be at least 4 characters.", "warning")
                 return
-            self.saved_password = typed
+            self.pending_password = typed
             self.target_len = len(dts)
             if self.mx > 1:
                 self._set_feedback(f"✅ Password locked as '{typed}'. Repeat {self.mx-1} more times to train.", "ok")
             else:
                 self._set_feedback(f"✅ Password locked. Ready to compile.", "ok")
-        elif typed != self.saved_password:
+        elif typed != self.pending_password:
             self._set_feedback("⚠️ Password mismatch! Capture discarded. Please try again.", "warning")
             return
-        if len(dts) > self.target_len: dts = dts[:self.target_len]
-        while len(dts) < self.target_len: dts.append(0.0)
+
+        dts = self._normalize_timing_sequence(dts, self.target_len)
+        if dts is None:
+            self._set_feedback("⚠️ Capture length mismatch. Type with the exact same cadence length.", "warning")
+            return
+
+        if self.a_dts:
+            prev_means = np.array([float(np.mean(seq)) for seq in self.a_dts], dtype=float)
+            current_mean = float(np.mean(dts))
+            if len(prev_means) >= 2:
+                mean_prev = float(np.mean(prev_means))
+                std_prev = float(np.std(prev_means))
+                if std_prev > 1e-9:
+                    z_score = abs((current_mean - mean_prev) / std_prev)
+                    if z_score > 2.5:
+                        self.outlier_reject_count += 1
+                        self.stat_rej.setText(str(self.outlier_reject_count))
+                        self._set_feedback("⚠️ Capture rejected — timing too inconsistent. Please retype normally.", "warning")
+                        return
+
         self.a_dts.append(dts)
         self._add_session_bar(len(self.a_dts) - 1, keys_pressed, avg_ms)
         if len(self.a_dts) == 1 and self.mx > 1:
-            self._set_feedback(f"✅ Password locked as '{self.saved_password}'. Capture 1/{self.mx} saved.", "ok")
+            self._set_feedback(f"✅ Password locked as '{self.pending_password}'. Capture 1/{self.mx} saved.", "ok")
         else:
             self._set_feedback(f"✅  Capture {len(self.a_dts)}/{self.mx} saved", "ok")
         self._refresh_session_ui()
@@ -1225,6 +1493,7 @@ class CadenceApp(QMainWindow):
     def _refresh_session_ui(self):
         n = len(self.a_dts)
         self.stat_sess.setText(str(n))
+        self.stat_rej.setText(str(self.outlier_reject_count))
         pct = min(100, int((n / self.mx) * 100))
         self.rhythm_prog.setValue(pct)
         can_train = n >= self.mx
@@ -1246,6 +1515,9 @@ class CadenceApp(QMainWindow):
 
     def _start_training(self):
         if not self.a_dts: return
+        if self.pending_password:
+            mode = "deep" if len(self.e_dts) > 0 else "quick"
+            self.db.set_auth_profile(self.pending_password, self.target_len, mode)
         self.train_btn.setEnabled(False)
         self.train_btn.setText("⏳  Training Neural Network…")
         self.train_status.setText("Running LSTM training — please wait…")
@@ -1287,11 +1559,19 @@ class CadenceApp(QMainWindow):
                     self.target_len = self.keystroke_engine.svm_model.n_features_in_
             except Exception:
                 pass
+
+            if self.pending_password:
+                mode = "deep" if len(self.e_dts) > 0 else "quick"
+                self.db.set_auth_profile(self.pending_password, self.target_len, mode)
+
             self.train_btn.setText("✅  Training Complete")
             self.train_status.setText("Model saved. Neural network is now active.")
             self.train_status.setStyleSheet("color: #00cc55; font-size: 11px; background: transparent;")
             self.sys_status.setText("● AI READY")
             self.sys_status.setStyleSheet("color: #00ff88; font-weight: bold;")
+
+            # Keep plaintext password only for immediate setup UX; vault uses hashed verification.
+            self.pending_password = ""
             QTimer.singleShot(1500, lambda: self.route(0))
         else:
             self.train_btn.setEnabled(True)
@@ -1350,7 +1630,8 @@ class CadenceApp(QMainWindow):
         self.face_progress.setVisible(True)
         self.face_progress.setValue(0)
         self.face_progress.setStyleSheet("QProgressBar::chunk { background-color: #00ff88; border-radius: 4px; }")
-        self.face_status_lbl.setText("Detecting Neural Landmarks...")
+        self.face_engine.reset_liveness_state()
+        self.face_status_lbl.setText("Please blink to confirm liveness...")
         self.face_status_lbl.setStyleSheet("color: #aaaaaa;")
         self.scan_timer = QTimer(self)
         self.scan_timer.timeout.connect(self.update_face_scan)
@@ -1358,19 +1639,25 @@ class CadenceApp(QMainWindow):
         self.scan_val = 0
 
     def update_face_scan(self):
-        self.scan_val += 1
+        self.scan_val = min(100, self.scan_val + 1)
         self.face_progress.setValue(self.scan_val)
-        if self.scan_val >= 100:
+        if not hasattr(self, 'live_frame'):
+            return
+
+        live_ok, live_msg = self.face_engine.update_liveness(self.live_frame.copy())
+        self.face_status_lbl.setText(live_msg)
+        self.face_status_lbl.setStyleSheet("color: #ffaa33;" if not live_ok else "color: #00ff88;")
+
+        if self.scan_val >= 100 and live_ok:
             self.scan_timer.stop()
-            if hasattr(self, 'live_frame'):
-                self.face_status_lbl.setText("Compiling Neural Face Profile (Please Wait)...")
-                self.face_status_lbl.setStyleSheet("color: #ffaa33;")
-                QApplication.processEvents()
-                
-                self.enroll_thread = AITaskThread(self.face_engine.enroll_face, self.live_frame.copy())
-                self.enroll_thread.result_signal.connect(self._on_enroll_finished)
-                self.enroll_thread.error_signal.connect(self._on_enroll_error)
-                self.enroll_thread.start()
+            self.face_status_lbl.setText("Compiling Neural Face Profile (Please Wait)...")
+            self.face_status_lbl.setStyleSheet("color: #ffaa33;")
+            QApplication.processEvents()
+
+            self.enroll_thread = AITaskThread(self.face_engine.enroll_face, self.live_frame.copy())
+            self.enroll_thread.result_signal.connect(self._on_enroll_finished)
+            self.enroll_thread.error_signal.connect(self._on_enroll_error)
+            self.enroll_thread.start()
 
     def _on_enroll_finished(self, success):
         if success:
@@ -1378,7 +1665,7 @@ class CadenceApp(QMainWindow):
             self.face_status_lbl.setStyleSheet("color: #00ff88;")
             QTimer.singleShot(1500, lambda: self.route(0))
         else:
-            self.face_status_lbl.setText("❌ Detection Failed. Ensure 'OPTIMAL' visibility and try again.")
+            self.face_status_lbl.setText("❌ Detection/Liveness failed. Ensure visibility and blink once.")
             self.face_status_lbl.setStyleSheet("color: #ff3333;")
             self.face_progress.setStyleSheet("QProgressBar::chunk { background-color: #ff3333; }")
             self.start_face_btn.setEnabled(True)
@@ -1397,3 +1684,4 @@ if __name__ == "__main__":
     window = CadenceApp()
     window.show()
     sys.exit(app_gui.exec())
+    
