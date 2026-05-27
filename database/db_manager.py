@@ -16,6 +16,8 @@ class DatabaseManager:
     PASSWORD_SALT_KEY = "password_salt"
     PASSWORD_ITERATIONS_KEY = "password_iterations"
     PASSWORD_ITERATIONS = 200_000
+    BIOMETRIC_KEY_SALT_KEY = "biometric_key_salt"
+    BIOMETRIC_KEY_ITERATIONS = 100_000
     LEGACY_PASSWORD_KEYS = ("pwd", "password")
 
     def __init__(self, base_dir="database"):
@@ -138,12 +140,20 @@ class DatabaseManager:
 
     def _derive_biometric_key(self):
         password_hash = self.config.get(self.PASSWORD_HASH_KEY)
-        password_salt = self.config.get(self.PASSWORD_SALT_KEY)
-        if not password_hash or not password_salt:
+        biometric_key_salt = self.config.get(self.BIOMETRIC_KEY_SALT_KEY)
+        if not password_hash:
             raise ValueError("Password profile not initialized; cannot derive biometric key.")
+        if not biometric_key_salt:
+            raise ValueError("Profile requires re-enrollment: biometric key salt missing.")
 
-        digest = hashlib.sha256(f"{password_hash}:{password_salt}".encode("utf-8")).digest()
-        return base64.urlsafe_b64encode(digest)
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            str(password_hash).encode("utf-8"),
+            bytes.fromhex(biometric_key_salt),
+            self.BIOMETRIC_KEY_ITERATIONS,
+            dklen=32,
+        )
+        return base64.urlsafe_b64encode(derived)
 
     def get_biometric_cipher(self):
         return Fernet(self._derive_biometric_key())
@@ -219,6 +229,8 @@ class DatabaseManager:
         self.config[self.PASSWORD_SALT_KEY] = salt_hex
         self.config[self.PASSWORD_HASH_KEY] = digest_hex
         self.config[self.PASSWORD_ITERATIONS_KEY] = iterations
+        if not self.config.get(self.BIOMETRIC_KEY_SALT_KEY):
+            self.config[self.BIOMETRIC_KEY_SALT_KEY] = secrets.token_bytes(16).hex()
         self.config["target_len"] = int(target_len or 0)
         self.config["mode"] = str(mode or "quick")
 

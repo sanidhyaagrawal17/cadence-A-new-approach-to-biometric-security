@@ -733,6 +733,12 @@ class CadenceApp(QMainWindow):
     def _password_matches(self, typed_password):
         return self.db.verify_password(typed_password)
 
+    def _mask_password(self, pwd):
+        value = str(pwd or "")
+        if len(value) <= 2:
+            return "****"
+        return f"{value[0]}{'*' * (len(value) - 2)}{value[-1]}"
+
     def _normalize_timing_sequence(self, dts, target_len):
         if target_len <= 0:
             return list(dts)
@@ -1451,7 +1457,7 @@ class CadenceApp(QMainWindow):
             self.pending_password = typed
             self.target_len = len(dts)
             if self.mx > 1:
-                self._set_feedback(f"✅ Password locked as '{typed}'. Repeat {self.mx-1} more times to train.", "ok")
+                self._set_feedback(f"✅ Password locked as '{self._mask_password(typed)}'. Repeat {self.mx-1} more times to train.", "ok")
             else:
                 self._set_feedback(f"✅ Password locked. Ready to compile.", "ok")
         elif typed != self.pending_password:
@@ -1480,7 +1486,7 @@ class CadenceApp(QMainWindow):
         self.a_dts.append(dts)
         self._add_session_bar(len(self.a_dts) - 1, keys_pressed, avg_ms)
         if len(self.a_dts) == 1 and self.mx > 1:
-            self._set_feedback(f"✅ Password locked as '{self.pending_password}'. Capture 1/{self.mx} saved.", "ok")
+            self._set_feedback(f"✅ Password locked as '{self._mask_password(self.pending_password)}'. Capture 1/{self.mx} saved.", "ok")
         else:
             self._set_feedback(f"✅  Capture {len(self.a_dts)}/{self.mx} saved", "ok")
         self._refresh_session_ui()
