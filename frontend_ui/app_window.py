@@ -8,13 +8,15 @@ import gc
 import stat
 import shutil
 import json
+import hashlib
 import urllib.request
+import threading
 import numpy as np
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QStackedWidget, QLineEdit, 
                              QProgressBar, QFrame, QGridLayout, QSizePolicy,
-                             QPushButton, QButtonGroup, QTextEdit, QScrollArea, QCheckBox,
-                             QDialog, QMessageBox, QInputDialog, QComboBox, QGraphicsBlurEffect)
+                             QPushButton, QButtonGroup, QTextEdit, QScrollArea, QCheckBox, QTabWidget,
+                             QDialog, QMessageBox, QInputDialog, QComboBox, QGraphicsBlurEffect, QFileDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QEvent, QTimer, QRect, QDateTime
 from PyQt6.QtGui import QImage, QPixmap, QKeyEvent, QCursor
 
@@ -26,6 +28,7 @@ from frontend_ui.custom_widgets import TimingChart
 
 INTRUDER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "intruders"))
 os.makedirs(INTRUDER_DIR, exist_ok=True)
+CAFFEMODEL_SHA256 = "15aa163954ee51de5b3e6d0271dd84b8c5e578da856c34c24b8c6d188a2b2eec"
 
 try:
     from tensorflow import keras as tf_keras  # type: ignore
@@ -460,7 +463,10 @@ class CadenceApp(QMainWindow):
         if not os.path.exists(self.prototxt_path):
             urllib.request.urlretrieve("https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt", self.prototxt_path)
         if not os.path.exists(self.caffemodel_path):
-            urllib.request.urlretrieve("https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel", self.caffemodel_path)
+            self._download_caffemodel_with_checksum(
+                "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel",
+                self.caffemodel_path,
+            )
             
         self.face_net = cv2.dnn.readNetFromCaffe(self.prototxt_path, self.caffemodel_path)
         
@@ -482,13 +488,22 @@ class CadenceApp(QMainWindow):
         self.missing_frames = 0 
         self.is_locked = False
         self.is_locking = False  
+        self.frame_lock = threading.Lock()
         self.pending_password = ""
+        self.login_attempts = 0
+        self.login_lockout_remaining = 0
+        self.login_lockout_timer = QTimer(self)
+        self.login_lockout_timer.timeout.connect(self._update_login_lockout)
+        self.inactivity_timeout_ms = 300000
+        self.inactivity_timer = QTimer(self)
+        self.inactivity_timer.setSingleShot(True)
+        self.inactivity_timer.timeout.connect(self._handle_inactivity_timeout)
         self.is_ai_ready = (self.keystroke_engine.is_quick_trained or self.keystroke_engine.is_deep_trained) and self.db.has_password()
         self.st = 'idl'          
         self.tms = []            
         self.flight_times = []   
         self.a_dts = []          
-        self.e_dts = []          
+        self.baseline_dts = []
         self.mx = 5              
         self.target_len = self.db.get_target_len()
         
@@ -510,6 +525,7 @@ class CadenceApp(QMainWindow):
         central_widget = QWidget()
         central_widget.setObjectName("main_container")
         self.setCentralWidget(central_widget)
+        central_widget.setMouseTracking(True)
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
@@ -529,7 +545,47 @@ class CadenceApp(QMainWindow):
         self.rhythm_input.installEventFilter(self)     
         self.installEventFilter(self)                  
         self.route(0 if self.is_ai_ready else 1)
+        self._reset_inactivity_timer()
+        self.setMouseTracking(True)
         self.showMaximized()
+
+    def _start_login_lockout(self):
+        if self.login_attempts < 2:
+            return
+        self.login_lockout_remaining = min(60, 2 ** (self.login_attempts - 1))
+        self.dash_test_input.setEnabled(False)
+        self.dash_login_btn.setEnabled(False)
+        self.dash_lockout_lbl.setText(f"Retry in {self.login_lockout_remaining}s")
+        self.login_lockout_timer.start(1000)
+
+    def _update_login_lockout(self):
+        if self.login_lockout_remaining <= 1:
+            self.login_lockout_timer.stop()
+            self.login_lockout_remaining = 0
+            self.dash_lockout_lbl.setText("")
+            self.dash_test_input.setEnabled(True)
+            self.dash_login_btn.setEnabled(True)
+            return
+        self.login_lockout_remaining -= 1
+        self.dash_lockout_lbl.setText(f"Retry in {self.login_lockout_remaining}s")
+
+    def _download_caffemodel_with_checksum(self, url, path):
+        urllib.request.urlretrieve(url, path)
+        with open(path, "rb") as f:
+            checksum = hashlib.sha256(f.read()).hexdigest()
+        if checksum != CAFFEMODEL_SHA256:
+            if os.path.exists(path):
+                os.remove(path)
+            raise RuntimeError("Model file checksum mismatch. Download may be corrupt or tampered. Please retry.")
+
+    def _reset_inactivity_timer(self):
+        if self.inactivity_timeout_ms > 0:
+            self.inactivity_timer.start(self.inactivity_timeout_ms)
+        else:
+            self.inactivity_timer.stop()
+
+    def _handle_inactivity_timeout(self):
+        self._trigger_soft_lockout()
 
     def stop_camera(self):
         if self.camera_thread and self.camera_thread.isRunning():
@@ -537,14 +593,25 @@ class CadenceApp(QMainWindow):
             self.camera_thread = None
 
     def _current_live_frame(self):
-        if hasattr(self, "live_frame"):
-            return self.live_frame
+        with self.frame_lock:
+            if hasattr(self, "live_frame"):
+                return self.live_frame.copy()
         return None
 
     def _set_reverify_mode(self, mode):
         self.reverify_mode = mode
         self.reverify_failures = 0
         self._start_background_verify()
+
+    def _set_inactivity_timeout(self, label):
+        mapping = {
+            "off": 0,
+            "2 min": 120000,
+            "5 min": 300000,
+            "10 min": 600000,
+        }
+        self.inactivity_timeout_ms = mapping.get(str(label).strip().lower(), 300000)
+        self._reset_inactivity_timer()
 
     def _get_reverify_failure_limit(self):
         return {"off": None, "low": 5, "high": 2}.get(self.reverify_mode, None)
@@ -573,6 +640,7 @@ class CadenceApp(QMainWindow):
             return
 
         self.reverify_failures += 1
+        self.db.log_event("BACKGROUND_VERIFY_FAIL", f"count={self.reverify_failures}")
         if self.reverify_failures >= limit:
             self._trigger_soft_lockout()
 
@@ -590,6 +658,7 @@ class CadenceApp(QMainWindow):
         if self.soft_locked:
             return
         self.soft_locked = True
+        self.db.log_event("SOFT_LOCKOUT", "background verification failed")
         self._stop_background_verify()
         self._set_soft_lock_visual(True)
         self.dash_result.setText("⚠️ Continuous verification failed. Re-authentication required.")
@@ -601,6 +670,7 @@ class CadenceApp(QMainWindow):
         self.stop_camera()
         self.db.set_active_profile(profile_name, create_if_missing=True)
         self.active_profile = self.db.get_active_profile()
+        self.db.log_event("PROFILE_SWITCH", self.active_profile)
 
         self.keystroke_engine = CadenceKeystrokeEngine(self.active_profile)
         self.face_engine = CadenceFaceEngine(self.active_profile)
@@ -622,13 +692,29 @@ class CadenceApp(QMainWindow):
         name, ok = QInputDialog.getText(self, "Create Profile", "Enter new profile name:")
         if not ok or not name.strip():
             return
-        self.db.create_profile(name.strip())
+        try:
+            profile_name = self.db._sanitise_profile_name(name)
+            self.db.create_profile(profile_name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Profile Name", str(e))
+            return
         self.profile_select.blockSignals(True)
         self.profile_select.clear()
         self.profile_select.addItems(self.db.list_profiles())
-        self.profile_select.setCurrentText(name.strip())
+        self.profile_select.setCurrentText(profile_name)
         self.profile_select.blockSignals(False)
-        self._switch_profile(name.strip())
+        self._switch_profile(profile_name)
+
+    def _refresh_audit_log(self):
+        if not hasattr(self, "audit_log_view"):
+            return
+        audit_path = os.path.join(self.db.get_profile_dir(), "audit.log")
+        if not os.path.exists(audit_path):
+            self.audit_log_view.setPlainText("No audit events yet.")
+            return
+        with open(audit_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-50:]
+        self.audit_log_view.setPlainText("".join(lines).strip() or "No audit events yet.")
 
     def _check_taskbar_hover(self):
         if self.isFullScreen() and self.isActiveWindow():
@@ -642,9 +728,22 @@ class CadenceApp(QMainWindow):
             else:
                 self.hover_ticks = 0
 
+    def mouseMoveEvent(self, event):
+        self._reset_inactivity_timer()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._reset_inactivity_timer()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        self._reset_inactivity_timer()
+        super().keyPressEvent(event)
+
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.KeyPress:
             if type(event) == QKeyEvent and not event.isAutoRepeat():
+                self._reset_inactivity_timer()
                 k = event.key()
                 if k in (Qt.Key.Key_Escape, Qt.Key.Key_F11):
                     if self.isFullScreen(): self.showMaximized()
@@ -783,6 +882,7 @@ class CadenceApp(QMainWindow):
             self.dash_test_input.setFocus()
             self.start_camera_for_view(self.face_cam_label)
             self._start_background_verify()
+            self._refresh_audit_log()
         elif index == 1:
             self._reset_ui()
         elif index == 2:
@@ -859,7 +959,8 @@ class CadenceApp(QMainWindow):
                     cv_img[y1:y2, x1:x2] = cv2.LUT(roi_color, table)
                     gray_frame[y1:y2, x1:x2] = cv2.LUT(roi_gray, table)
 
-        self.live_frame = cv_img.copy()
+        with self.frame_lock:
+            self.live_frame = cv_img.copy()
 
         if (self.stack.currentIndex() == 2 or self.is_locking) and self.last_face_box is not None:
             x, y, w_face, h_face = self.last_face_box
@@ -970,6 +1071,14 @@ class CadenceApp(QMainWindow):
         layout.setSpacing(25)
         title = QLabel("System Dashboard", objectName="h1")
         layout.addWidget(title)
+        tabs = QTabWidget()
+        tabs.setStyleSheet("QTabWidget::pane { border: 1px solid #333; border-radius: 8px; background: #111; } QTabBar::tab { background: #151515; color: #aaa; padding: 10px 14px; border: 1px solid #333; border-bottom: none; } QTabBar::tab:selected { background: #1a1a1a; color: #00ff88; }")
+
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        settings_layout.setContentsMargins(20, 20, 20, 20)
+        settings_layout.setSpacing(16)
 
         profile_row = QHBoxLayout()
         profile_row.addWidget(QLabel("Active Profile:"))
@@ -983,18 +1092,26 @@ class CadenceApp(QMainWindow):
         self.new_profile_btn.clicked.connect(self._create_profile)
         profile_row.addWidget(self.new_profile_btn)
         profile_row.addStretch()
-        layout.addLayout(profile_row)
+        settings_layout.addLayout(profile_row)
 
         reverify_row = QHBoxLayout()
         reverify_row.addWidget(QLabel("Continuous Face Re-Verify:"))
         self.reverify_select = QComboBox()
         self.reverify_select.addItems(["Off", "Low", "High"])
-        self.reverify_select.currentTextChanged.connect(
-            lambda v: self._set_reverify_mode(v.lower())
-        )
+        self.reverify_select.currentTextChanged.connect(lambda v: self._set_reverify_mode(v.lower()))
         reverify_row.addWidget(self.reverify_select)
         reverify_row.addStretch()
-        layout.addLayout(reverify_row)
+        settings_layout.addLayout(reverify_row)
+
+        timeout_row = QHBoxLayout()
+        timeout_row.addWidget(QLabel("Session Inactivity Timeout:"))
+        self.inactivity_select = QComboBox()
+        self.inactivity_select.addItems(["Off", "2 min", "5 min", "10 min"])
+        self.inactivity_select.setCurrentText("5 min")
+        self.inactivity_select.currentTextChanged.connect(self._set_inactivity_timeout)
+        timeout_row.addWidget(self.inactivity_select)
+        timeout_row.addStretch()
+        settings_layout.addLayout(timeout_row)
 
         card = QFrame()
         card.setObjectName("dash_card")
@@ -1015,19 +1132,56 @@ class CadenceApp(QMainWindow):
         self.wipe_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.wipe_btn.clicked.connect(self._wipe_system)
         card_layout.addWidget(self.wipe_btn)
-        layout.addWidget(card)
+        settings_layout.addWidget(card)
+
+        bundle_row = QHBoxLayout()
+        self.export_btn = QPushButton("⬆ Export Profile")
+        self.export_btn.setObjectName("ghost_btn")
+        self.export_btn.clicked.connect(self._export_profile_bundle)
+        bundle_row.addWidget(self.export_btn)
+        self.import_btn = QPushButton("⬇ Import Profile")
+        self.import_btn.setObjectName("ghost_btn")
+        self.import_btn.clicked.connect(self._import_profile_bundle)
+        bundle_row.addWidget(self.import_btn)
+        bundle_row.addStretch()
+        settings_layout.addLayout(bundle_row)
+
         test_lbl = QLabel("Test Neural Rhythm Engine (Inline)", objectName="h2")
         test_lbl.setStyleSheet("font-size: 18px; font-weight: bold; margin-top: 20px; background: transparent;")
-        layout.addWidget(test_lbl)
+        settings_layout.addWidget(test_lbl)
         self.dash_test_input = QLineEdit()
         self.dash_test_input.setPlaceholderText("Type your password to test Cadence...")
         self.dash_test_input.setEchoMode(QLineEdit.EchoMode.Password)
-        
-        layout.addWidget(self.dash_test_input)
+        login_row = QHBoxLayout()
+        login_row.addWidget(self.dash_test_input, 1)
+        self.dash_login_btn = QPushButton("Authenticate")
+        self.dash_login_btn.setObjectName("action_btn")
+        self.dash_login_btn.clicked.connect(self._test_login)
+        login_row.addWidget(self.dash_login_btn)
+        self.dash_lockout_lbl = QLabel("")
+        self.dash_lockout_lbl.setStyleSheet("color: #ffaa33; font-size: 11px; background: transparent;")
+        login_row.addWidget(self.dash_lockout_lbl)
+        settings_layout.addLayout(login_row)
         self.dash_result = QLabel("")
         self.dash_result.setStyleSheet("font-size: 16px; font-weight: bold;")
-        layout.addWidget(self.dash_result)
-        layout.addStretch()
+        settings_layout.addWidget(self.dash_result)
+        settings_layout.addStretch()
+
+        audit_tab = QWidget()
+        audit_layout = QVBoxLayout(audit_tab)
+        audit_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        audit_layout.setContentsMargins(20, 20, 20, 20)
+        audit_layout.setSpacing(10)
+        audit_layout.addWidget(QLabel("Audit Log", objectName="h2"))
+        self.audit_log_view = QTextEdit()
+        self.audit_log_view.setReadOnly(True)
+        self.audit_log_view.setStyleSheet("QTextEdit { background-color: #0d0d0d; color: #ccc; border: 1px solid #333; border-radius: 8px; font-family: Consolas, monospace; }")
+        audit_layout.addWidget(self.audit_log_view)
+
+        tabs.addTab(settings_tab, "Settings")
+        tabs.addTab(audit_tab, "Audit Log")
+        layout.addWidget(tabs)
+        self._refresh_audit_log()
         return w
 
     def _wipe_system(self):
@@ -1113,6 +1267,35 @@ class CadenceApp(QMainWindow):
             self.route(1)
             self._set_feedback("System wiped successfully. RAM and PyCache cleared.", "ok")
 
+    def _export_profile_bundle(self):
+        if not self.db:
+            return
+        default_name = f"{self.active_profile}.cadence"
+        bundle_path, _ = QFileDialog.getSaveFileName(self, "Export Profile", default_name, "Cadence Profile (*.cadence)")
+        if not bundle_path:
+            return
+        try:
+            self.db.export_profile_bundle(bundle_path)
+            QMessageBox.information(self, "Export Complete", "Encrypted profile bundle exported successfully.")
+        except Exception as e:
+            QMessageBox.warning(self, "Export Failed", str(e))
+
+    def _import_profile_bundle(self):
+        if not self.db:
+            return
+        bundle_path, _ = QFileDialog.getOpenFileName(self, "Import Profile", "", "Cadence Profile (*.cadence)")
+        if not bundle_path:
+            return
+        try:
+            self.db.import_profile_bundle(bundle_path)
+            self.keystroke_engine = CadenceKeystrokeEngine(self.active_profile)
+            self.face_engine = CadenceFaceEngine(self.active_profile)
+            self.is_ai_ready = (self.keystroke_engine.is_quick_trained or self.keystroke_engine.is_deep_trained) and self.db.has_password()
+            self._refresh_audit_log()
+            QMessageBox.information(self, "Import Complete", "Encrypted profile bundle imported successfully.")
+        except Exception as e:
+            QMessageBox.warning(self, "Import Failed", str(e))
+
     def _launch_mock_lock(self):
         if not self.is_ai_ready:
             QMessageBox.warning(self, "AI Untrained", "Please train the Cadence Neural Network before testing the Lock Screen.")
@@ -1146,9 +1329,12 @@ class CadenceApp(QMainWindow):
             return
             
         if not self._password_matches(typed_pwd):
+            self.login_attempts += 1
             self.dash_result.setText("❌ ACCESS DENIED (Invalid Password)")
             self.dash_result.setStyleSheet("color: #ff3333;")
+            self.db.log_event("LOGIN_FAIL", "wrong password")
             self._record_intruder_attempt("password_mismatch", typed_pwd, dts, "dashboard")
+            self._start_login_lockout()
             self.clr_trk()
             self.dash_test_input.setReadOnly(False)
             self.dash_test_input.setFocus()
@@ -1156,9 +1342,12 @@ class CadenceApp(QMainWindow):
 
         dts = self._normalize_timing_sequence(dts, self.target_len)
         if dts is None:
+            self.login_attempts += 1
             self.dash_result.setText("❌ ACCESS DENIED (Inconsistent timing capture length)")
             self.dash_result.setStyleSheet("color: #ff3333;")
+            self.db.log_event("LOGIN_FAIL", "keystroke mismatch")
             self._record_intruder_attempt("timing_length_mismatch", typed_pwd, self.get_dts(), "dashboard")
+            self._start_login_lockout()
             self.clr_trk()
             self.dash_test_input.setReadOnly(False)
             self.dash_test_input.setFocus()
@@ -1167,7 +1356,10 @@ class CadenceApp(QMainWindow):
         try:
             quick_ok, quick_score = self.keystroke_engine.verify_quick_setup(np.array([dts]))
         except Exception as e:
+            self.login_attempts += 1
             self.dash_result.setText(f"Verification Error: {e}")
+            self.db.log_event("LOGIN_FAIL", "keystroke mismatch")
+            self._start_login_lockout()
             self.clr_trk()
             self.dash_test_input.setReadOnly(False)
             self.dash_test_input.setFocus()
@@ -1176,13 +1368,18 @@ class CadenceApp(QMainWindow):
         if quick_ok:
             self.dash_result.setText(f"✅ RHYTHM PASSED (Quick score: {quick_score:.2f}). Proceeding to Face Check...")
             self.dash_result.setStyleSheet("color: #00ff88;")
+            self.login_attempts = 0
+            self.db.log_event("LOGIN_SUCCESS", f"quick={quick_score:.2f}")
         elif self.keystroke_engine.is_deep_trained:
             try:
                 deep_ok, deep_score = self.keystroke_engine.verify_deep_learning(dts)
             except Exception as e:
+                self.login_attempts += 1
                 self.dash_result.setText(f"❌ ACCESS DENIED (Quick score: {quick_score:.2f}; Deep error: {e})")
                 self.dash_result.setStyleSheet("color: #ff3333;")
+                self.db.log_event("LOGIN_FAIL", "keystroke mismatch")
                 self._record_intruder_attempt("keystroke_mismatch", typed_pwd, dts, "dashboard")
+                self._start_login_lockout()
                 self.clr_trk()
                 self.dash_test_input.setReadOnly(False)
                 self.dash_test_input.setFocus()
@@ -1191,14 +1388,22 @@ class CadenceApp(QMainWindow):
             if deep_ok:
                 self.dash_result.setText(f"✅ RHYTHM PASSED (Quick: {quick_score:.2f}, Deep: {deep_score:.2f})")
                 self.dash_result.setStyleSheet("color: #00ff88;")
+                self.login_attempts = 0
+                self.db.log_event("LOGIN_SUCCESS", f"deep={deep_score:.2f}")
             else:
+                self.login_attempts += 1
                 self.dash_result.setText(f"❌ ACCESS DENIED (Quick: {quick_score:.2f}, Deep: {deep_score:.2f})")
                 self.dash_result.setStyleSheet("color: #ff3333;")
+                self.db.log_event("LOGIN_FAIL", "keystroke mismatch")
                 self._record_intruder_attempt("keystroke_mismatch", typed_pwd, dts, "dashboard")
+                self._start_login_lockout()
         else:
+            self.login_attempts += 1
             self.dash_result.setText(f"❌ ACCESS DENIED (Quick score: {quick_score:.2f})")
             self.dash_result.setStyleSheet("color: #ff3333;")
+            self.db.log_event("LOGIN_FAIL", "keystroke mismatch")
             self._record_intruder_attempt("keystroke_mismatch", typed_pwd, dts, "dashboard")
+            self._start_login_lockout()
             
         self.clr_trk()
         self.dash_test_input.setReadOnly(False)
@@ -1330,7 +1535,7 @@ class CadenceApp(QMainWindow):
         self.st = 'idl'
         self.mx = 5
         self.a_dts = []
-        self.e_dts = []
+        self.baseline_dts = []
         self.outlier_reject_count = 0
         self.typd = ""
         self.pending_password = ""
@@ -1358,7 +1563,7 @@ class CadenceApp(QMainWindow):
         if msg is None:
             self.mx = 5
             self.a_dts = []
-            self.e_dts = []
+            self.baseline_dts = []
             self.outlier_reject_count = 0
             self.pending_password = ""
             while self.session_list_layout.count() > 1:
@@ -1386,7 +1591,7 @@ class CadenceApp(QMainWindow):
         self.st = 'dp'
         self.mx = 8
         self.a_dts = []
-        self.e_dts = []
+        self.baseline_dts = []
         self.outlier_reject_count = 0
         self.pending_password = ""
         while self.session_list_layout.count() > 1:
@@ -1428,7 +1633,7 @@ class CadenceApp(QMainWindow):
         self.esy_lbl.setText(f"<div style='font-family: Consolas; font-size: 15px; line-height: 1.4;'>{h}</div>")
 
     def _fin_esy(self):
-        self.e_dts = self.get_dts()
+        self.baseline_dts = self.get_dts()
         self.mx = 8
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("Phase 1 Complete")
@@ -1451,8 +1656,8 @@ class CadenceApp(QMainWindow):
         self.stat_keys.setText("--")
         self.timing_chart.update_data([])
         if not self.a_dts:
-            if len(typed) < 4:
-                self._set_feedback("⚠️ Password must be at least 4 characters.", "warning")
+            if len(typed) < 8:
+                self._set_feedback("⚠️ Password must be at least 8 characters for sufficient keystroke signal.", "warning")
                 return
             self.pending_password = typed
             self.target_len = len(dts)
@@ -1520,9 +1725,14 @@ class CadenceApp(QMainWindow):
         self.rhythm_feedback.setStyleSheet(f"font-size: 12px; color: {colors.get(level, '#666')}; background: transparent;")
 
     def _start_training(self):
-        if not self.a_dts: return
+        if not self.a_dts:
+            self._set_feedback("⚠️ Capture at least one rhythm sequence before training.", "warning")
+            return
+        if len(self.a_dts) < self.mx:
+            self._set_feedback(f"⚠️ Training requires {self.mx} captures; you have {len(self.a_dts)}.", "warning")
+            return
         if self.pending_password:
-            mode = "deep" if len(self.e_dts) > 0 else "quick"
+            mode = "deep" if len(self.baseline_dts) > 0 else "quick"
             self.db.set_auth_profile(self.pending_password, self.target_len, mode)
         self.train_btn.setEnabled(False)
         self.train_btn.setText("⏳  Training Neural Network…")
@@ -1531,16 +1741,16 @@ class CadenceApp(QMainWindow):
 
         class TrainThread(QThread):
             done = pyqtSignal(bool)
-            def __init__(self, keystroke_engine, e_dts, a_dts):
+            def __init__(self, keystroke_engine, baseline_dts, a_dts):
                 super().__init__()
                 self.eng = keystroke_engine
-                self.e_dts = e_dts
+                self.baseline_dts = baseline_dts
                 self.a_dts = a_dts
             def run(self):
                 try:
                     import numpy as np
                     data_array = np.array(self.a_dts)
-                    if len(self.e_dts) > 0: 
+                    if len(self.baseline_dts) > 0: 
                         labels = np.ones(len(data_array)) 
                         self.eng.train_deep_learning(data_array, labels)
                         self.eng.train_quick_setup(data_array) 
@@ -1551,7 +1761,7 @@ class CadenceApp(QMainWindow):
                     print("Training Error:", e)
                     self.done.emit(False)
 
-        self._train_thread = TrainThread(self.keystroke_engine, list(self.e_dts), list(self.a_dts))
+        self._train_thread = TrainThread(self.keystroke_engine, list(self.baseline_dts), list(self.a_dts))
         self._train_thread.done.connect(self._on_training_done)
         self._train_thread.start()
 
@@ -1567,7 +1777,7 @@ class CadenceApp(QMainWindow):
                 pass
 
             if self.pending_password:
-                mode = "deep" if len(self.e_dts) > 0 else "quick"
+                mode = "deep" if len(self.baseline_dts) > 0 else "quick"
                 self.db.set_auth_profile(self.pending_password, self.target_len, mode)
 
             self.train_btn.setText("✅  Training Complete")
@@ -1575,6 +1785,9 @@ class CadenceApp(QMainWindow):
             self.train_status.setStyleSheet("color: #00cc55; font-size: 11px; background: transparent;")
             self.sys_status.setText("● AI READY")
             self.sys_status.setStyleSheet("color: #00ff88; font-weight: bold;")
+
+            if self.face_engine.is_enrolled:
+                self.db.log_event("ENROLLMENT_COMPLETE", "keystroke + face")
 
             # Keep plaintext password only for immediate setup UX; vault uses hashed verification.
             self.pending_password = ""
@@ -1669,6 +1882,8 @@ class CadenceApp(QMainWindow):
         if success:
             self.face_status_lbl.setText("✅ Target Locked. Profile Saved.")
             self.face_status_lbl.setStyleSheet("color: #00ff88;")
+            if self.keystroke_engine.is_quick_trained or self.keystroke_engine.is_deep_trained:
+                self.db.log_event("ENROLLMENT_COMPLETE", "face + keystroke")
             QTimer.singleShot(1500, lambda: self.route(0))
         else:
             self.face_status_lbl.setText("❌ Detection/Liveness failed. Ensure visibility and blink once.")

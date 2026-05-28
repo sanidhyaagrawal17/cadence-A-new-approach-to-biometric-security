@@ -107,6 +107,42 @@ class CadenceKeystrokeEngine:
             raise ValueError("Timing sequence contains impossible zero/negative intervals.")
         return data
 
+    def _extract_dwell_features(self, sequence, sample_points=8):
+        sequence = np.asarray(sequence, dtype=float).ravel()
+        if sequence.size == 0:
+            raise ValueError("Timing sequence is empty.")
+
+        x_source = np.linspace(0.0, 1.0, num=sequence.size, endpoint=True)
+        x_target = np.linspace(0.0, 1.0, num=sample_points, endpoint=True)
+        curve = np.interp(x_target, x_source, sequence)
+
+        diffs = np.diff(sequence) if sequence.size > 1 else np.array([0.0], dtype=float)
+        stats = np.array([
+            float(np.mean(sequence)),
+            float(np.std(sequence)),
+            float(np.median(sequence)),
+            float(np.min(sequence)),
+            float(np.max(sequence)),
+            float(sequence[0]),
+            float(sequence[-1]),
+            float(np.mean(diffs)),
+        ], dtype=float)
+        return np.concatenate([curve.astype(float), stats], axis=0)
+
+    def _prepare_feature_matrix(self, sequences):
+        data = self._validate_sequences(sequences)
+        return np.vstack([self._extract_dwell_features(seq) for seq in data])
+
+    def _adaptive_svm_nu(self, feature_data):
+        feature_data = np.asarray(feature_data, dtype=float)
+        if feature_data.size == 0:
+            return 0.05
+
+        spread = float(np.mean(np.std(feature_data, axis=0)))
+        sample_pressure = min(1.0, len(feature_data) / 20.0)
+        nu = 0.03 + (0.06 * spread) + (0.08 * sample_pressure)
+        return float(np.clip(nu, 0.03, 0.2))
+
     def _reject_outliers(self, data):
         if len(data) < 4:
             return data
@@ -152,8 +188,10 @@ class CadenceKeystrokeEngine:
         # Gaussian Micro-Jitter: Prevents Kernel Collapse by simulating minor typing flaws
         noise = np.random.normal(0, 0.001, raw_data.shape)
         robust_data = raw_data + noise
+        feature_data = self._prepare_feature_matrix(robust_data)
         
-        scaled_data = self.scaler.fit_transform(robust_data)
+        self.svm_model = OneClassSVM(kernel='rbf', gamma='scale', nu=self._adaptive_svm_nu(feature_data))
+        scaled_data = self.scaler.fit_transform(feature_data)
         self.svm_model.fit(scaled_data)
         
         self.db.save_model("keystroke_svm.pkl.enc", self.svm_model)
@@ -166,9 +204,9 @@ class CadenceKeystrokeEngine:
         if not self.is_quick_trained:
             raise ValueError("Quick setup model is not trained yet.")
             
-        sequence = self._validate_sequences(sequence)
-            
-        scaled_seq = self.scaler.transform(sequence)
+        feature_seq = self._prepare_feature_matrix(sequence)
+
+        scaled_seq = self.scaler.transform(feature_seq)
         preds = self.svm_model.predict(scaled_seq)
         score = float(np.mean(preds == 1))
         success = score >= 0.5
@@ -185,9 +223,11 @@ class CadenceKeystrokeEngine:
 
             augmented = self._augment_genuine_sequences(genuine, variants=5)
             impostors = self._make_synthetic_impostors(augmented)
+            augmented_features = self._prepare_feature_matrix(augmented)
+            impostor_features = self._prepare_feature_matrix(impostors)
 
-            train_x = np.concatenate([augmented, impostors], axis=0)
-            train_y = np.concatenate([np.ones(len(augmented)), np.zeros(len(impostors))], axis=0)
+            train_x = np.concatenate([augmented_features, impostor_features], axis=0)
+            train_y = np.concatenate([np.ones(len(augmented_features)), np.zeros(len(impostor_features))], axis=0)
 
             perm = np.random.default_rng(21).permutation(len(train_x))
             train_x = train_x[perm]
@@ -219,12 +259,9 @@ class CadenceKeystrokeEngine:
             raise ValueError("Deep learning model is not trained yet.")
             
         with (tf.device('/CPU:0') if tf is not None else nullcontext()):
-            sequence = self._validate_sequences(sequence)
-            if len(sequence.shape) == 1:
-                sequence = sequence.reshape(1, -1, 1)
-            elif len(sequence.shape) == 2:
-                sequence = np.expand_dims(sequence, axis=-1)
-            prediction = self.lstm_model.predict(sequence, verbose=0)
+            feature_seq = self._prepare_feature_matrix(sequence)
+            feature_seq = np.expand_dims(feature_seq, axis=-1)
+            prediction = self.lstm_model.predict(feature_seq, verbose=0)
             
         score = float(prediction[0][0])
         success = score >= 0.85

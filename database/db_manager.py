@@ -7,7 +7,10 @@ import shutil
 import secrets
 import hmac
 import hashlib
+import re
 import tempfile
+import zipfile
+from datetime import datetime, timezone
 from cryptography.fernet import Fernet
 import joblib
 
@@ -40,6 +43,12 @@ class DatabaseManager:
         os.makedirs(self.profiles_dir, exist_ok=True)
         self._migrate_legacy_single_user_data()
         self.set_active_profile("default", create_if_missing=True)
+
+    def _sanitise_profile_name(self, name):
+        profile_name = str(name or "").strip()
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", profile_name):
+            raise ValueError("Invalid profile name.")
+        return profile_name
 
     def _migrate_legacy_single_user_data(self):
         default_dir = os.path.join(self.profiles_dir, "default")
@@ -87,7 +96,7 @@ class DatabaseManager:
         return profiles
 
     def set_active_profile(self, username, create_if_missing=False):
-        username = str(username or "default").strip() or "default"
+        username = self._sanitise_profile_name(username or "default")
         profile_dir = os.path.join(self.profiles_dir, username)
         if not os.path.exists(profile_dir):
             if not create_if_missing:
@@ -115,6 +124,17 @@ class DatabaseManager:
     def get_face_baseline_path(self):
         return os.path.join(self.profile_dir, "face_baseline.jpg")
 
+    def log_event(self, event_type, detail=""):
+        os.makedirs(self.profile_dir, exist_ok=True)
+        audit_path = os.path.join(self.profile_dir, "audit.log")
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event_type": str(event_type),
+            "detail": str(detail),
+        }
+        with open(audit_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
     def _initialize_vault(self):
         """Loads the vault into RAM, or creates a new one if missing."""
         if os.path.exists(self.config_path):
@@ -139,6 +159,10 @@ class DatabaseManager:
             json.dump(self.config, f, indent=4)
 
     def _derive_biometric_key(self):
+        material = self._derive_biometric_key_material()
+        return base64.urlsafe_b64encode(material)
+
+    def _derive_biometric_key_material(self):
         password_hash = self.config.get(self.PASSWORD_HASH_KEY)
         biometric_key_salt = self.config.get(self.BIOMETRIC_KEY_SALT_KEY)
         if not password_hash:
@@ -146,14 +170,13 @@ class DatabaseManager:
         if not biometric_key_salt:
             raise ValueError("Profile requires re-enrollment: biometric key salt missing.")
 
-        derived = hashlib.pbkdf2_hmac(
+        return hashlib.pbkdf2_hmac(
             "sha256",
             str(password_hash).encode("utf-8"),
             bytes.fromhex(biometric_key_salt),
             self.BIOMETRIC_KEY_ITERATIONS,
             dklen=32,
         )
-        return base64.urlsafe_b64encode(derived)
 
     def get_biometric_cipher(self):
         return Fernet(self._derive_biometric_key())
@@ -162,8 +185,11 @@ class DatabaseManager:
         cipher = self.get_biometric_cipher()
         path = os.path.join(self.profile_dir, filename)
         encrypted = cipher.encrypt(content_bytes)
+        signature = hmac.new(self._derive_biometric_key_material(), encrypted, hashlib.sha256).hexdigest()
         with open(path, "wb") as f:
             f.write(encrypted)
+        with open(f"{path}.hmac", "w", encoding="utf-8") as f:
+            f.write(signature)
         return path
 
     def load_encrypted_bytes(self, filename):
@@ -171,6 +197,14 @@ class DatabaseManager:
         path = os.path.join(self.profile_dir, filename)
         with open(path, "rb") as f:
             encrypted = f.read()
+        hmac_path = f"{path}.hmac"
+        if not os.path.exists(hmac_path):
+            raise RuntimeError("Model file integrity check failed. File may be tampered.")
+        with open(hmac_path, "r", encoding="utf-8") as f:
+            stored_signature = f.read().strip()
+        computed_signature = hmac.new(self._derive_biometric_key_material(), encrypted, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(stored_signature, computed_signature):
+            raise RuntimeError("Model file integrity check failed. File may be tampered.")
         return cipher.decrypt(encrypted)
 
     def save_model(self, filename, obj):
@@ -209,6 +243,47 @@ class DatabaseManager:
         finally:
             if temp_path and os.path.exists(temp_path):
                 os.remove(temp_path)
+
+    def export_profile_bundle(self, bundle_path):
+        os.makedirs(os.path.dirname(bundle_path) or ".", exist_ok=True)
+        payload_buffer = io.BytesIO()
+        with zipfile.ZipFile(payload_buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for root, _, files in os.walk(self.profile_dir):
+                for name in files:
+                    file_path = os.path.join(root, name)
+                    archive.write(file_path, os.path.relpath(file_path, self.profile_dir))
+
+        encrypted = self.get_biometric_cipher().encrypt(payload_buffer.getvalue())
+        signature = hmac.new(self._derive_biometric_key_material(), encrypted, hashlib.sha256).hexdigest()
+        with open(bundle_path, "wb") as f:
+            f.write(encrypted)
+        with open(f"{bundle_path}.hmac", "w", encoding="utf-8") as f:
+            f.write(signature)
+        return bundle_path
+
+    def import_profile_bundle(self, bundle_path):
+        with open(bundle_path, "rb") as f:
+            encrypted = f.read()
+
+        hmac_path = f"{bundle_path}.hmac"
+        if not os.path.exists(hmac_path):
+            raise RuntimeError("Profile bundle integrity check failed. File may be tampered.")
+        with open(hmac_path, "r", encoding="utf-8") as f:
+            stored_signature = f.read().strip()
+        computed_signature = hmac.new(self._derive_biometric_key_material(), encrypted, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(stored_signature, computed_signature):
+            raise RuntimeError("Profile bundle integrity check failed. File may be tampered.")
+
+        payload = self.get_biometric_cipher().decrypt(encrypted)
+        if os.path.exists(self.profile_dir):
+            shutil.rmtree(self.profile_dir, ignore_errors=True)
+        os.makedirs(self.profile_dir, exist_ok=True)
+
+        with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+            archive.extractall(self.profile_dir)
+
+        self._initialize_vault()
+        return True
 
     def _derive_password_hash(self, password, salt_hex=None, iterations=None):
         """Derives a salted PBKDF2-HMAC hash for the local password vault."""

@@ -24,23 +24,27 @@ class CadenceFaceEngine:
         self.ear_threshold = 0.25
         self.reset_liveness_state()
 
+        self.mp_face_mesh = None
+        self.mesh_detector = None
         if MP_AVAILABLE and mp is not None:
-            self.mp_face_mesh = mp.solutions.face_mesh
-            self.mesh_detector = self.mp_face_mesh.FaceMesh(
-                static_image_mode=False,
-                max_num_faces=1,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
-            )
-        else:
-            self.mp_face_mesh = None
-            self.mesh_detector = None
+            try:
+                self.mp_face_mesh = mp.solutions.face_mesh
+                self.mesh_detector = self.mp_face_mesh.FaceMesh(
+                    static_image_mode=False,
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.5,
+                    min_tracking_confidence=0.5,
+                )
+            except Exception as exc:
+                print(f"[FACE CORE] MediaPipe FaceMesh unavailable; using fallback liveness/alignment. ({exc})")
+                self.mp_face_mesh = None
+                self.mesh_detector = None
 
     def reset_liveness_state(self):
         self._closed_frame_streak = 0
         self._blink_count = 0
-        self._liveness_confirmed = False
+        self._liveness_confirmed = not (MP_AVAILABLE and self.mesh_detector is not None)
 
     def _eye_aspect_ratio(self, points):
         p2_p6 = np.linalg.norm(points[1] - points[5])
@@ -49,6 +53,26 @@ class CadenceFaceEngine:
         if p1_p4 == 0:
             return 1.0
         return (p2_p6 + p3_p5) / (2.0 * p1_p4)
+
+    def _align_face_frame(self, frame):
+        if not MP_AVAILABLE or self.mesh_detector is None:
+            return frame
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.mesh_detector.process(rgb)
+        if not results.multi_face_landmarks:
+            return frame
+
+        lm = results.multi_face_landmarks[0].landmark
+        h, w = frame.shape[:2]
+
+        left_eye = np.array([lm[33].x * w, lm[33].y * h], dtype=float)
+        right_eye = np.array([lm[263].x * w, lm[263].y * h], dtype=float)
+        eye_center = ((left_eye + right_eye) / 2.0).tolist()
+        angle = np.degrees(np.arctan2(right_eye[1] - left_eye[1], right_eye[0] - left_eye[0]))
+
+        matrix = cv2.getRotationMatrix2D(tuple(eye_center), angle, 1.0)
+        return cv2.warpAffine(frame, matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
     def update_liveness(self, frame):
         if not MP_AVAILABLE or self.mesh_detector is None:
@@ -110,7 +134,8 @@ class CadenceFaceEngine:
                 print("[FACE CORE] Enrollment blocked: liveness not confirmed.")
                 return False
 
-            optimized_frame = self.enhance_lighting(frame)
+            aligned_frame = self._align_face_frame(frame)
+            optimized_frame = self.enhance_lighting(aligned_frame)
             
             # Detect face to ensure there is actually a person in the frame
             faces = DeepFace.extract_faces(img_path=optimized_frame, enforce_detection=True, detector_backend='opencv')
@@ -162,7 +187,8 @@ class CadenceFaceEngine:
             np_arr = np.frombuffer(decrypted_bytes, np.uint8)
             baseline_img_array = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-            optimized_frame = self.enhance_lighting(current_frame)
+            aligned_frame = self._align_face_frame(current_frame)
+            optimized_frame = self.enhance_lighting(aligned_frame)
 
             live_faces = DeepFace.extract_faces(
                 img_path=optimized_frame,
