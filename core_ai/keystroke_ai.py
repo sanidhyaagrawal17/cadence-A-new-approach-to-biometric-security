@@ -212,17 +212,34 @@ class CadenceKeystrokeEngine:
         success = score >= 0.5
         return success, float(score)
 
-    def train_deep_learning(self, sequences, labels, epochs=15):
+    def train_deep_learning(self, sequences, labels=None, epochs=15):
         if not TF_AVAILABLE or self.lstm_model is None or tf is None:
             raise ValueError("Deep learning setup unavailable: TensorFlow runtime is not available.")
 
         with (tf.device('/CPU:0') if tf is not None else nullcontext()):
-            genuine = self._validate_sequences(sequences)
+            data = self._validate_sequences(sequences)
+
+            # If explicit labels are provided, use them to partition genuine vs impostor
+            if labels is not None and len(labels) == len(data):
+                labels_arr = np.asarray(labels).ravel()
+                genuine = data[labels_arr == 1]
+                impostor_src = data[labels_arr == 0]
+            else:
+                # No labels supplied: assume all provided sequences are genuine
+                genuine = data
+                impostor_src = None
+
             if len(genuine) < 8:
                 raise ValueError("Deep learning setup requires at least 8 genuine captures.")
 
             augmented = self._augment_genuine_sequences(genuine, variants=5)
-            impostors = self._make_synthetic_impostors(augmented)
+
+            # Use provided impostor sequences when available; otherwise create synthetic impostors
+            if impostor_src is not None and len(impostor_src) > 0:
+                impostors = impostor_src
+            else:
+                impostors = self._make_synthetic_impostors(augmented)
+
             augmented_features = self._prepare_feature_matrix(augmented)
             impostor_features = self._prepare_feature_matrix(impostors)
 
@@ -289,5 +306,5 @@ class CadenceKeystrokeEngine:
         # 3. The Gray Area (Wake up the Deep Learning Model)
         else:
             print(f"Gatekeeper Unsure (Score: {svm_score:.2f}). Waking Deep Check...")
-            lstm_success, lstm_score = self.verify_deep_learning(sequence)
+            lstm_success, lstm_score = self.verify_deep_learning(np.array([sequence]))
             return lstm_success, lstm_score, "LSTM Deep-Check"

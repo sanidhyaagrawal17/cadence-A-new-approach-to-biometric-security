@@ -44,7 +44,11 @@ class CadenceFaceEngine:
     def reset_liveness_state(self):
         self._closed_frame_streak = 0
         self._blink_count = 0
-        self._liveness_confirmed = not (MP_AVAILABLE and self.mesh_detector is not None)
+        # Allow disabling liveness entirely via env var for testing/dev
+        if os.environ.get('DISABLE_LIVENESS', '') == '1':
+            self._liveness_confirmed = True
+        else:
+            self._liveness_confirmed = not (MP_AVAILABLE and self.mesh_detector is not None)
 
     def _eye_aspect_ratio(self, points):
         p2_p6 = np.linalg.norm(points[1] - points[5])
@@ -75,6 +79,11 @@ class CadenceFaceEngine:
         return cv2.warpAffine(frame, matrix, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
     def update_liveness(self, frame):
+        # Honor explicit disable flag
+        if os.environ.get('DISABLE_LIVENESS', '') == '1':
+            self._liveness_confirmed = True
+            return True, "Liveness disabled by environment variable."
+
         if not MP_AVAILABLE or self.mesh_detector is None:
             return True, "Liveness fallback active (MediaPipe unavailable)."
 

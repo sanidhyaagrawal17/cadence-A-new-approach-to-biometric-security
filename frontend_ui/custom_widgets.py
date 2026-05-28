@@ -49,6 +49,8 @@ class ModeButton(QFrame):
     def __init__(self, text, icon, desc):
         super().__init__()
         self.setFixedHeight(94)
+        from PyQt6.QtWidgets import QSizePolicy
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)

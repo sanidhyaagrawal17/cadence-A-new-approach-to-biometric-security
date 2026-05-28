@@ -33,8 +33,15 @@ class DatabaseManager:
         self.profile_dir = ""
         self.config_path = ""
         
-        # Enterprise Customer Support Secret (Hardcoded offline salt)
-        self.__SUPPORT_MASTER_SECRET = b"CADENCE_CORP_SECURE_KEY_2026_XYZ"
+        # Enterprise Customer Support Secret: load from environment for safety.
+        # Set `CADENCE_SUPPORT_SECRET` in the environment or via a .env loader.
+        env_secret = os.environ.get("CADENCE_SUPPORT_SECRET")
+        if env_secret:
+            self.__SUPPORT_MASTER_SECRET = env_secret.encode("utf-8")
+        else:
+            # Explicitly set to None so callers can detect missing secret and
+            # avoid silently falling back to an insecure hardcoded key.
+            self.__SUPPORT_MASTER_SECRET = None
         
         self.config = {}
         self._initialize_storage()
@@ -122,7 +129,8 @@ class DatabaseManager:
         return self.profile_dir
 
     def get_face_baseline_path(self):
-        return os.path.join(self.profile_dir, "face_baseline.jpg")
+        # Face baseline is stored as encrypted binary; use .enc extension.
+        return os.path.join(self.profile_dir, "face_baseline.enc")
 
     def log_event(self, event_type, detail=""):
         os.makedirs(self.profile_dir, exist_ok=True)
@@ -316,21 +324,40 @@ class DatabaseManager:
 
     def verify_password(self, input_password):
         """Verifies a password and migrates matching legacy plaintext entries."""
+        # Always perform both PBKDF2 derivation and legacy checks to avoid
+        # timing side-channels that reveal which code path was executed.
         password_hash = self.config.get(self.PASSWORD_HASH_KEY)
         salt_hex = self.config.get(self.PASSWORD_SALT_KEY)
         iterations = int(self.config.get(self.PASSWORD_ITERATIONS_KEY, self.PASSWORD_ITERATIONS))
 
-        if password_hash and salt_hex:
+        # Derive candidate hash using real salt if present, otherwise use a random salt
+        if salt_hex:
             _, candidate_hash, _ = self._derive_password_hash(input_password, salt_hex, iterations)
-            return secrets.compare_digest(password_hash, candidate_hash)
+        else:
+            # Use a dummy salt to keep timing consistent
+            dummy_salt = secrets.token_bytes(16).hex()
+            _, candidate_hash, _ = self._derive_password_hash(input_password, dummy_salt, iterations)
 
+        hash_match = False
+        if password_hash and salt_hex:
+            hash_match = secrets.compare_digest(password_hash, candidate_hash)
+
+        # Legacy check: compare against any legacy plaintexts (constant-time compare)
+        legacy_match = False
         for key in self.LEGACY_PASSWORD_KEYS:
             legacy_password = self.config.get(key)
-            if legacy_password is not None and secrets.compare_digest(str(legacy_password), str(input_password)):
-                self.set_auth_profile(input_password, self.get_target_len(), self.config.get("mode", "quick"))
-                return True
+            if legacy_password is not None:
+                try:
+                    if secrets.compare_digest(str(legacy_password), str(input_password)):
+                        legacy_match = True
+                except Exception:
+                    pass
 
-        return False
+        # If either method matched, migrate and return True
+        if legacy_match:
+            self.set_auth_profile(input_password, self.get_target_len(), self.config.get("mode", "quick"))
+
+        return bool(hash_match or legacy_match)
 
     def has_password(self):
         has_hash = bool(self.config.get(self.PASSWORD_HASH_KEY) and self.config.get(self.PASSWORD_SALT_KEY))
@@ -363,15 +390,19 @@ class DatabaseManager:
         """
         device_uid = self.get_device_uid()
         
-        # Generate the expected mathematical signature
+        if not self.__SUPPORT_MASTER_SECRET:
+            raise RuntimeError("Support secret not configured. Set CADENCE_SUPPORT_SECRET in environment.")
+
+        # Generate the expected mathematical signature (use full HMAC digest)
         signature = hmac.new(
-            self.__SUPPORT_MASTER_SECRET, 
-            device_uid.encode('utf-8'), 
+            self.__SUPPORT_MASTER_SECRET,
+            device_uid.encode('utf-8'),
             hashlib.sha256
         ).hexdigest().upper()
-        
-        # Extract slices to make the Support Key look like a software product key (XXXX-XXXX-XXXX)
-        expected_key = f"{signature[:4]}-{signature[4:8]}-{signature[8:12]}"
+
+        # Use 128 bits (32 hex chars) of the HMAC for the user-facing support key
+        # and display it in grouped form to resist brute-force attacks.
+        expected_key = f"{signature[:8]}-{signature[8:16]}-{signature[16:32]}"
         
         # Standardize user input
         cleaned_input = str(input_key).strip().upper().replace(" ", "")
@@ -382,14 +413,21 @@ class DatabaseManager:
 # ==========================================
 # SUPPORT DASHBOARD SIMULATOR (For Testing)
 # ==========================================
-def support_dashboard_keygen(device_uid):
+def support_dashboard_keygen(device_uid, secret=None):
     """
     Run this function independently on a different computer to act as 'Customer Support'.
     It generates the unlock key when a user calls in with their Device UID.
     """
-    secret = b"CADENCE_CORP_SECURE_KEY_2026_XYZ"
+    # Allow callers (support tooling) to provide the secret explicitly. If not
+    # provided, read from the environment. Raise an error if unavailable.
+    if secret is None:
+        env = os.environ.get("CADENCE_SUPPORT_SECRET")
+        if not env:
+            raise RuntimeError("Support secret not configured. Set CADENCE_SUPPORT_SECRET in environment.")
+        secret = env.encode("utf-8")
+
     signature = hmac.new(secret, str(device_uid).encode('utf-8'), hashlib.sha256).hexdigest().upper()
-    return f"{signature[:4]}-{signature[4:8]}-{signature[8:12]}"
+    return f"{signature[:8]}-{signature[8:16]}-{signature[16:32]}"
 
 if __name__ == "__main__":
     # If you run this file directly, it acts as the Support Team's key generator

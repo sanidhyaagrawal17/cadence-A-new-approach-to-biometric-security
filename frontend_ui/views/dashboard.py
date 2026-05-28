@@ -1,0 +1,203 @@
+from PyQt6.QtWidgets import (QFrame, QHBoxLayout, QVBoxLayout, QLabel, QWidget, QTabWidget,
+                             QComboBox, QPushButton, QLineEdit, QTextEdit, QProgressBar)
+from PyQt6.QtCore import Qt
+import os
+
+from frontend_ui.custom_widgets import SidebarCard
+
+
+class DashboardBuilder:
+    def __init__(self, app):
+        self.app = app
+
+    def header(self):
+        app = self.app
+        header = QFrame()
+        header.setObjectName("app_header")
+        header.setFixedHeight(60)
+        header.setStyleSheet("QFrame#app_header { background-color: #0f0f0f; border-bottom: 1px solid #222; }")
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(20, 0, 20, 0)
+        logo = QLabel("🛡️ CADENCE BIOMETRIC")
+        logo.setStyleSheet("font-size: 18px; font-weight: bold; color: white;")
+        layout.addWidget(logo)
+        sub = QLabel("Dual-Layer Authentication System v2.0")
+        sub.setStyleSheet("color: #666;")
+        layout.addWidget(sub)
+        layout.addStretch()
+        app.sys_status = QLabel("● AI READY" if app.is_ai_ready else "● AI UNTRAINED")
+        app.sys_status.setStyleSheet(f"color: {'#00ff88' if app.is_ai_ready else '#ff3333'}; font-weight: bold;")
+        layout.addWidget(app.sys_status)
+        return header
+
+    def sidebar(self, parent_layout):
+        app = self.app
+        sidebar = QFrame()
+        sidebar.setFixedWidth(280)
+        sidebar.setStyleSheet("background-color: transparent;")
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        app.card_ctrl = SidebarCard("System Controls", "Manage security overrides and monitor access.", "⚙️")
+        app.card_ctrl.clicked.connect(lambda: app.route(0))
+        layout.addWidget(app.card_ctrl)
+        app.card_rhythm = SidebarCard("Setup Password Rhythm", "Configure keystroke dynamics with LSTM neural network analysis.", "⌨️")
+        app.card_rhythm.clicked.connect(lambda: app.route(1))
+        layout.addWidget(app.card_rhythm)
+        app.card_face = SidebarCard("Setup Face ID", "Initialize real-time facial recognition with HD scanning.", "👁️")
+        app.card_face.clicked.connect(lambda: app.route(2))
+        layout.addWidget(app.card_face)
+        layout.addStretch()
+        parent_layout.addWidget(sidebar)
+
+    def footer(self):
+        app = self.app
+        footer = QFrame()
+        footer.setObjectName("app_footer")
+        footer.setFixedHeight(40)
+        footer.setStyleSheet("QFrame#app_footer { background-color: #0a0a0a; border-top: 1px solid #222; }")
+        layout = QHBoxLayout(footer)
+        layout.setContentsMargins(20, 5, 20, 5)
+        def make_stat(title, val, color, obj_name=None):
+            w = QWidget()
+            l = QVBoxLayout(w)
+            l.setContentsMargins(0, 0, 0, 0)
+            t = QLabel(title)
+            t.setStyleSheet("color: #666; font-size: 10px; background: transparent;")
+            v = QLabel(val)
+            if obj_name: v.setObjectName(obj_name)
+            v.setStyleSheet(f"color: {color}; font-weight: bold; font-size: 12px; background: transparent;")
+            l.addWidget(t)
+            l.addWidget(v)
+            return w
+        layout.addWidget(make_stat("AUTHENTICATION LAYERS", "2", "#00ff88"))
+        layout.addWidget(make_stat("DEVICE UID", f"{app.db.get_device_uid()}", "#ffcc00", "uid_label"))
+        layout.addStretch()
+        lbl_hint = QLabel("PRESS [ESC] OR [F11] TO TOGGLE FULLSCREEN")
+        lbl_hint.setStyleSheet("color: #444; font-size: 10px; font-weight: bold;")
+        layout.addWidget(lbl_hint)
+        layout.addSpacing(20)
+        layout.addWidget(make_stat("SECURITY LEVEL", "MAXIMUM", "#00ff88"))
+        return footer
+
+    def dashboard_widget(self):
+        app = self.app
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        layout.setContentsMargins(60, 40, 60, 40)
+        layout.setSpacing(25)
+        title = QLabel("System Dashboard", objectName="h1")
+        layout.addWidget(title)
+        tabs = QTabWidget()
+        tabs.setStyleSheet("QTabWidget::pane { border: 1px solid #333; border-radius: 8px; background: #111; } QTabBar::tab { background: #151515; color: #aaa; padding: 10px 14px; border: 1px solid #333; border-bottom: none; } QTabBar::tab:selected { background: #1a1a1a; color: #00ff88; }")
+
+        settings_tab = QWidget()
+        settings_layout = QVBoxLayout(settings_tab)
+        settings_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        settings_layout.setContentsMargins(20, 20, 20, 20)
+        settings_layout.setSpacing(16)
+
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Active Profile:"))
+        app.profile_select = QComboBox()
+        app.profile_select.addItems(app.db.list_profiles())
+        app.profile_select.setCurrentText(app.active_profile)
+        app.profile_select.currentTextChanged.connect(app._on_profile_changed)
+        profile_row.addWidget(app.profile_select)
+        app.new_profile_btn = QPushButton("+ New Profile")
+        app.new_profile_btn.setObjectName("ghost_btn")
+        app.new_profile_btn.clicked.connect(app._create_profile)
+        profile_row.addWidget(app.new_profile_btn)
+        profile_row.addStretch()
+        settings_layout.addLayout(profile_row)
+
+        reverify_row = QHBoxLayout()
+        reverify_row.addWidget(QLabel("Continuous Face Re-Verify:"))
+        app.reverify_select = QComboBox()
+        app.reverify_select.addItems(["Off", "Low", "High"]) 
+        app.reverify_select.currentTextChanged.connect(lambda v: app._set_reverify_mode(v.lower()))
+        reverify_row.addWidget(app.reverify_select)
+        reverify_row.addStretch()
+        settings_layout.addLayout(reverify_row)
+
+        timeout_row = QHBoxLayout()
+        timeout_row.addWidget(QLabel("Session Inactivity Timeout:"))
+        app.inactivity_select = QComboBox()
+        app.inactivity_select.addItems(["Off", "2 min", "5 min", "10 min"])
+        app.inactivity_select.setCurrentText("5 min")
+        app.inactivity_select.currentTextChanged.connect(app._set_inactivity_timeout)
+        timeout_row.addWidget(app.inactivity_select)
+        timeout_row.addStretch()
+        settings_layout.addLayout(timeout_row)
+
+        card = QFrame()
+        card.setObjectName("dash_card")
+        card.setStyleSheet("QFrame#dash_card { background-color: #151515; border: 1px solid #333; border-radius: 8px; }")
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(30, 30, 30, 30)
+        app.test_lock_btn = QPushButton("🔒 Test Cadence Lock Screen")
+        app.test_lock_btn.setStyleSheet("""
+            QPushButton { background-color: #0055ff; color: white; padding: 12px 24px; border-radius: 8px; font-weight: bold; font-size: 14px; border: none; }
+            QPushButton:hover { background-color: #0044cc; }
+        """)
+        app.test_lock_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        app.test_lock_btn.clicked.connect(app._launch_mock_lock)
+        card_layout.addWidget(app.test_lock_btn)
+        card_layout.addStretch()
+        app.wipe_btn = QPushButton("🛑 Wipe Biometrics")
+        app.wipe_btn.setStyleSheet("background-color: transparent; border: 1px solid #ff3333; color: #ff3333; padding: 10px 20px; border-radius: 8px; font-weight: bold;")
+        app.wipe_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        app.wipe_btn.clicked.connect(app._wipe_system)
+        card_layout.addWidget(app.wipe_btn)
+        settings_layout.addWidget(card)
+
+        bundle_row = QHBoxLayout()
+        app.export_btn = QPushButton("⬆ Export Profile")
+        app.export_btn.setObjectName("ghost_btn")
+        app.export_btn.clicked.connect(app._export_profile_bundle)
+        bundle_row.addWidget(app.export_btn)
+        app.import_btn = QPushButton("⬇ Import Profile")
+        app.import_btn.setObjectName("ghost_btn")
+        app.import_btn.clicked.connect(app._import_profile_bundle)
+        bundle_row.addWidget(app.import_btn)
+        bundle_row.addStretch()
+        settings_layout.addLayout(bundle_row)
+
+        test_lbl = QLabel("Test Neural Rhythm Engine (Inline)", objectName="h2")
+        test_lbl.setStyleSheet("font-size: 18px; font-weight: bold; margin-top: 20px; background: transparent;")
+        settings_layout.addWidget(test_lbl)
+        app.dash_test_input = QLineEdit()
+        app.dash_test_input.setPlaceholderText("Type your password to test Cadence...")
+        app.dash_test_input.setEchoMode(QLineEdit.EchoMode.Password)
+        login_row = QHBoxLayout()
+        login_row.addWidget(app.dash_test_input, 1)
+        app.dash_login_btn = QPushButton("Authenticate")
+        app.dash_login_btn.setObjectName("action_btn")
+        app.dash_login_btn.clicked.connect(app._test_login)
+        login_row.addWidget(app.dash_login_btn)
+        app.dash_lockout_lbl = QLabel("")
+        app.dash_lockout_lbl.setStyleSheet("color: #ffaa33; font-size: 11px; background: transparent;")
+        login_row.addWidget(app.dash_lockout_lbl)
+        settings_layout.addLayout(login_row)
+        app.dash_result = QLabel("")
+        app.dash_result.setStyleSheet("font-size: 16px; font-weight: bold;")
+        settings_layout.addWidget(app.dash_result)
+        settings_layout.addStretch()
+
+        audit_tab = QWidget()
+        audit_layout = QVBoxLayout(audit_tab)
+        audit_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        audit_layout.setContentsMargins(20, 20, 20, 20)
+        audit_layout.setSpacing(10)
+        audit_layout.addWidget(QLabel("Audit Log", objectName="h2"))
+        app.audit_log_view = QTextEdit()
+        app.audit_log_view.setReadOnly(True)
+        app.audit_log_view.setStyleSheet("QTextEdit { background-color: #0d0d0d; color: #ccc; border: 1px solid #333; border-radius: 8px; font-family: Consolas, monospace; }")
+        audit_layout.addWidget(app.audit_log_view)
+
+        tabs.addTab(settings_tab, "Settings")
+        tabs.addTab(audit_tab, "Audit Log")
+        layout.addWidget(tabs)
+        app._refresh_audit_log()
+        return w
