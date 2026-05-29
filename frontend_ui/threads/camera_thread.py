@@ -1,8 +1,17 @@
+"""Camera thread helpers.
+
+Notes:
+- Fix camera latency by setting `CAP_PROP_BUFFERSIZE=1` so the OS drops
+    stale frames and only provides the newest frame to the application.
+- Use DirectShow backend on Windows for more consistent capture behavior.
+
+Change recorded: fix camera (2026-05-29)
+"""
+
 from PyQt6.QtCore import QThread, pyqtSignal
 import numpy as np
 import cv2
 import sys
-
 
 class CameraThread(QThread):
     change_pixmap_signal = pyqtSignal(np.ndarray)
@@ -12,8 +21,6 @@ class CameraThread(QThread):
         super().__init__()
         self.face_engine = face_engine
         self.running = True
-        # target frames per second (can be changed at runtime)
-        self.target_fps = 45
 
     def run(self):
         backend = cv2.CAP_DSHOW if sys.platform == 'win32' else cv2.CAP_ANY
@@ -21,34 +28,18 @@ class CameraThread(QThread):
         try:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            # request a higher capture FPS where supported
-            try:
-                cap.set(cv2.CAP_PROP_FPS, 45)
-            except Exception:
-                pass
+            # CRITICAL FIX: Force OS to only hold the newest frame to kill latency
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
+            
             if not cap.isOpened():
                 self.error_signal.emit("Camera could not be opened. Check permissions or device.")
                 return
+                
             while self.running:
-                # use grab/retrieve to lower latency on some backends
-                try:
-                    grabbed = cap.grab()
-                except Exception:
-                    grabbed = False
-                if grabbed:
-                    try:
-                        ret, cap_frame = cap.retrieve()
-                    except Exception:
-                        ret = False
-                        cap_frame = None
-                    if ret and cap_frame is not None:
-                        self.change_pixmap_signal.emit(cap_frame)
-                # compute sleep based on target_fps
-                try:
-                    sleep_ms = max(5, int(1000.0 / float(self.target_fps)))
-                except Exception:
-                    sleep_ms = 22
-                self.msleep(sleep_ms)
+                # Let the hardware clock govern the thread speed natively. No time.sleep()!
+                ret, cap_frame = cap.read()
+                if ret and cap_frame is not None:
+                    self.change_pixmap_signal.emit(cap_frame)
         finally:
             try:
                 cap.release()
