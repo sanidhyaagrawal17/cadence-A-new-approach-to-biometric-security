@@ -3,3 +3,14 @@ __pycache__/
 *.pkl 
 *.db 
 venv311/
+database/models/vault.key
+database/models/vault.json
+database/models/*.pkl
+database/models/*.keras
+database/models/*.enc
+database/profiles/
+# PyInstaller & Build Files
+dist/
+build/
+*.spec
+*.zip
