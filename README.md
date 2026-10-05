@@ -58,7 +58,7 @@ flowchart TD
   * **Deep Mode (Keras LSTM)**: A 2-layer sequential LSTM network ($64 \rightarrow 32$ units with dropout) trained to capture temporal rhythms and subtle sequential typing cadences.
 
 ### 3. Encrypted Local Storage (`database/db_manager.py`)
-* Biometric templates, facial baselines, and model weights are encrypted at rest using AES-256 (`.enc` format), preventing unauthorized tampering or raw template leakage.
+* Biometric templates, facial baselines, and model weights are encrypted at rest using Fernet authenticated cryptography (AES-128-CBC + HMAC-SHA256) with salted PBKDF2 key derivation (100,000 iterations), ensuring encrypted local storage of sensitive biometric profiles.
 
 ---
 
